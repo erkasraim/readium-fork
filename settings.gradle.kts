@@ -95,3 +95,7 @@ project(":readium:streamer")
 
 include("test-app")
 include(":demos:navigator")
+
+include(":wasm-page-calculator")
+project(":wasm-page-calculator")
+    .name = "wasm-page-calculator"

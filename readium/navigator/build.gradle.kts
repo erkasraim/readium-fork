@@ -24,6 +24,7 @@ android {
 
 dependencies {
     api(project(":readium:readium-shared"))
+    implementation(project(":wasm-page-calculator"))
 
     implementation(files("libs/PhotoView-2.3.0.jar"))
 

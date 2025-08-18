@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+/src/main/rust/target/
+Cargo.lock
+
+# WASM generated files (pkg는 제외하지만 assets는 포함)
+/wasm-bindings/pkg/
+# *.wasm 라인 제거 - assets/wasm의 파일들은 git에 포함
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Gradle
+.gradle/
+build/
