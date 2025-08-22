@@ -41,6 +41,14 @@ android {
     }
 }
 
+// IMPORTANT:
+// - We DO NOT edit generated wasm-bindgen JS files by hand.
+// - Any changes to global exposure (e.g., window.calculate_pages_with_css) MUST be applied here
+//   in the Gradle post-processing step, so future builds regenerate glue correctly.
+// - If new Rust exports are added, expose them here by extending the snippet appended below.
+// - This comment is intentionally verbose so automated tools (including AI) can discover and
+//   maintain the exposure list in one place.
+
 // Rust/WASM 빌드 태스크 정의
 tasks.register<Exec>("buildWasm") {
     description = "Build WASM module using wasm-pack"
@@ -78,6 +86,10 @@ tasks.register<Exec>("buildWasm") {
     outputs.dir("wasm-bindings/pkg")
 
     // 빌드 후 바로 JavaScript 파일 후처리
+    // NOTE:
+    // - JS glue는 wasm-bindgen가 생성합니다. 여기서 window.* 글로벌에 노출할 항목을 추가합니다.
+    // - 절대 수동으로 assets의 JS를 편집하지 마세요. (이 블록만 수정)
+    // - 새 export를 추가했다면 아래 노출 목록에 포함시키세요: calculate_pages_with_css 등.
     doLast {
         val jsFile = File(project.projectDir, "wasm-bindings/pkg/epub_page_calculator.js")
         if (jsFile.exists()) {
@@ -86,9 +98,13 @@ tasks.register<Exec>("buildWasm") {
                 """
                 
                 // WebView 호환성을 위한 글로벌 변수 할당
+                // NOTE: 이 블록을 통해 wasm-bindgen export를 window.*에 노출합니다.
+                // - 새 export 추가 시 아래 목록에 추가하세요.
                 if (typeof window !== 'undefined') {
                     window.main = wasm_bindgen.main || wasm_bindgen.__exports?.main;
                     window.calculate_pages = wasm_bindgen.calculate_pages || wasm_bindgen.__exports?.calculate_pages;
+                    // 외부 CSS를 함께 전달하는 확장 API (Rust에서 추가된 export)
+                    window.calculate_pages_with_css = wasm_bindgen.calculate_pages_with_css || wasm_bindgen.__exports?.calculate_pages_with_css;
                     window.get_wasm_version = wasm_bindgen.get_wasm_version || wasm_bindgen.__exports?.get_wasm_version;
                     window.test_wasm_connection = wasm_bindgen.test_wasm_connection || wasm_bindgen.__exports?.test_wasm_connection;
                     window.initSync = wasm_bindgen.initSync || wasm_bindgen.initSync;
@@ -115,6 +131,9 @@ tasks.register<Copy>("copyWasmAssets") {
         include("*.d.ts")
     }
     into("wasm-bindings/assets/wasm")
+    doLast {
+        println("✅ WASM pkg -> assets/wasm 복사 완료")
+    }
 }
 
 // Android 빌드 전에 WASM 빌드 실행 (조건부)

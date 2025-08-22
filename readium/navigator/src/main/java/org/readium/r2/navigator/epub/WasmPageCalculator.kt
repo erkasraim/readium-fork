@@ -37,7 +37,10 @@ public data class SamplingData(
     val viewportWidth: Int,
     val viewportHeight: Int,
     val fontMetrics: FontMetrics,
-    val layoutMetrics: LayoutMetrics
+    val layoutMetrics: LayoutMetrics,
+    val elementStyles: Map<String, ElementStyle> = emptyMap(),
+    val cssVariables: Map<String, String> = emptyMap(),
+    val bodyStyle: BodyStyle? = null
 )
 
 /**
@@ -58,7 +61,37 @@ public data class LayoutMetrics(
     val marginTop: Int,
     val marginBottom: Int,
     val marginLeft: Int,
-    val marginRight: Int
+    val marginRight: Int,
+    val paddingTop: Int = 0,
+    val paddingBottom: Int = 0,
+    val paddingLeft: Int = 0,
+    val paddingRight: Int = 0
+)
+
+public data class ElementStyle(
+    val fontSize: Int,
+    val lineHeight: Int,
+    val marginTop: Int,
+    val marginRight: Int,
+    val marginBottom: Int,
+    val marginLeft: Int,
+    val paddingTop: Int,
+    val paddingRight: Int,
+    val paddingBottom: Int,
+    val paddingLeft: Int
+)
+
+public data class BodyStyle(
+    val contentWidth: Int,
+    val contentHeight: Int,
+    val marginTop: Int,
+    val marginRight: Int,
+    val marginBottom: Int,
+    val marginLeft: Int,
+    val paddingTop: Int,
+    val paddingRight: Int,
+    val paddingBottom: Int,
+    val paddingLeft: Int
 )
 
 /**
@@ -66,11 +99,12 @@ public data class LayoutMetrics(
  */
 internal interface WasmPageCalculator {
     /**
-     * Calculate total pages for HTML content using sampling data from WebView.
+     * Calculate total pages for HTML content using sampling JSON from WebView.
      */
     suspend fun calculatePages(
         html: String,
-        samplingData: SamplingData
+        cssText: String,
+        samplingJson: String
     ): WasmCalculationResult
 
     /**
@@ -151,13 +185,14 @@ internal class DefaultWasmPageCalculator(
 
     override suspend fun calculatePages(
         html: String,
-        samplingData: SamplingData
+        cssText: String,
+        samplingJson: String
     ): WasmCalculationResult = withContext(Dispatchers.Main) {
 
         if (!isInitialized || wasmWebView == null) {
             Log.w("WasmPageCalculator", "⚠️ WASM 미초기화, fallback 사용")
             return@withContext WasmCalculationResult(
-                totalPages = estimatePages(html, samplingData),
+                totalPages = estimatePages(html, samplingJson),
                 status = WasmCalculationResult.Status.FALLBACK_NEEDED
             )
         }
@@ -165,12 +200,8 @@ internal class DefaultWasmPageCalculator(
         try {
             Log.d("WasmPageCalculator", "🦀 WASM으로 페이지 계산 시작...")
 
-            // JSON 데이터 준비
-            val samplingDataJson = createSamplingDataJson(samplingData)
-            val escapedHtml = html.replace("'", "\\'").replace("\n", "\\n")
-
             // WASM 함수 호출
-            val result = callWasmCalculatePages(wasmWebView!!, escapedHtml, samplingDataJson)
+            val result = callWasmCalculatePages(wasmWebView!!, html, cssText, samplingJson)
 
             if (result != null) {
                 val resultJson = JSONObject(result)
@@ -187,14 +218,14 @@ internal class DefaultWasmPageCalculator(
             } else {
                 Log.w("WasmPageCalculator", "⚠️ WASM 계산 실패, fallback 사용")
                 WasmCalculationResult(
-                    totalPages = estimatePages(html, samplingData),
+                    totalPages = estimatePages(html, samplingJson),
                     status = WasmCalculationResult.Status.FALLBACK_NEEDED
                 )
             }
         } catch (e: Exception) {
             Log.e("WasmPageCalculator", "❌ WASM 계산 중 오류, fallback 사용", e)
             WasmCalculationResult(
-                totalPages = estimatePages(html, samplingData),
+                totalPages = estimatePages(html, samplingJson),
                 status = WasmCalculationResult.Status.FALLBACK_NEEDED
             )
         }
@@ -380,7 +411,7 @@ internal class DefaultWasmPageCalculator(
                             }
 
                             // 페이지 계산 함수 (간단 모듈 참조, ES6 import 없음)
-                            window.calculatePagesWasm = function(html, samplingDataJson) {
+                            window.calculatePagesWasm = function(html, cssText, samplingDataJson) {
                                 try {
                                     if (!wasmInitialized) {
                                         throw new Error('WASM 모듈이 초기화되지 않음');
@@ -388,9 +419,11 @@ internal class DefaultWasmPageCalculator(
 
                                     console.log('🦀 WASM 페이지 계산 시작...');
                                     console.log('📄 HTML 길이:', html.length);
+                                    console.log('🎨 CSS 길이:', (cssText || '').length);
                                     console.log('📊 샘플링 데이터:', samplingDataJson);
 
-                                    const result = window.calculate_pages(html, samplingDataJson);
+                                    const result = window.calculate_pages_with_css(html, cssText || '', samplingDataJson);
+                                        
                                     console.log('✅ WASM 페이지 계산 완료:', result);
 
                                     return result;
@@ -491,38 +524,19 @@ internal class DefaultWasmPageCalculator(
         }
 
     /**
-     * SamplingData를 JSON 문자열로 변환
-     */
-    private fun createSamplingDataJson(samplingData: SamplingData): String {
-        return JSONObject().apply {
-            put("viewportWidth", samplingData.viewportWidth)
-            put("viewportHeight", samplingData.viewportHeight)
-            put("fontMetrics", JSONObject().apply {
-                put("fontSize", samplingData.fontMetrics.fontSize)
-                put("lineHeight", samplingData.fontMetrics.lineHeight)
-                put("characterWidth", samplingData.fontMetrics.characterWidth)
-            })
-            put("layoutMetrics", JSONObject().apply {
-                put("contentWidth", samplingData.layoutMetrics.contentWidth)
-                put("contentHeight", samplingData.layoutMetrics.contentHeight)
-                put("marginTop", samplingData.layoutMetrics.marginTop)
-                put("marginBottom", samplingData.layoutMetrics.marginBottom)
-                put("marginLeft", samplingData.layoutMetrics.marginLeft)
-                put("marginRight", samplingData.layoutMetrics.marginRight)
-            })
-        }.toString()
-    }
-
-    /**
      * WebView에서 WASM 함수 호출
      */
     private suspend fun callWasmCalculatePages(
         webView: WebView,
         html: String,
-        samplingDataJson: String
+        cssText: String,
+        samplingJson: String
     ): String? = suspendCancellableCoroutine { continuation ->
         try {
-            val jsCode = "calculatePagesWasm('$html', '$samplingDataJson')"
+            val htmlJs = JSONObject.quote(html)
+            val cssJs = JSONObject.quote(cssText)
+            val samplingJs = JSONObject.quote(samplingJson)
+            val jsCode = "calculatePagesWasm($htmlJs, $cssJs, $samplingJs)"
 
             webView.evaluateJavascript(jsCode) { result ->
                 if (result != null && result != "null") {
@@ -546,7 +560,7 @@ internal class DefaultWasmPageCalculator(
     /**
      * Simple estimation algorithm as fallback for WASM implementation.
      */
-    private fun estimatePages(html: String, samplingData: SamplingData): Int {
+    private fun estimatePages(html: String, samplingJson: String): Int {
         Log.e("WasmPageCalculator", "🔥 estimatePages() 폴백 함수가 호출됨!")
 
         // Extract title or first heading for identification
@@ -560,26 +574,34 @@ internal class DefaultWasmPageCalculator(
         val textContent = html.replace(Regex("<[^>]+>"), "")
         val contentLength = textContent.length
 
-        val charsPerLine =
-            (samplingData.layoutMetrics.contentWidth / samplingData.fontMetrics.characterWidth).toInt()
-        val linesPerPage =
-            (samplingData.layoutMetrics.contentHeight / samplingData.fontMetrics.lineHeight).toInt()
+        // Parse sampling JSON to extract layout metrics
+        val samplingData = try {
+            JSONObject(samplingJson)
+        } catch (e: Exception) {
+            Log.w("WasmPageCalculator", "샘플링 JSON 파싱 실패, 기본값 사용", e)
+            null
+        }
+
+        val viewportWidth = samplingData?.optInt("viewportWidth", 800) ?: 800
+        val viewportHeight = samplingData?.optInt("viewportHeight", 600) ?: 600
+        val contentWidth = samplingData?.optInt("contentWidth", 800) ?: 800
+        val contentHeight = samplingData?.optInt("contentHeight", 600) ?: 600
+        val fontSize = samplingData?.optDouble("fontSize", 16.0)?.toFloat() ?: 16.0f
+        val lineHeight = samplingData?.optDouble("lineHeight", 24.0)?.toFloat() ?: 24.0f
+        val characterWidth = samplingData?.optDouble("characterWidth", 8.0)?.toFloat() ?: 8.0f
+
+        val charsPerLine = (contentWidth / characterWidth).toInt()
+        val linesPerPage = (contentHeight / lineHeight).toInt()
         val charsPerPage = charsPerLine * linesPerPage
 
         Log.i("WasmPageCalculator", "=== Fallback Page Calculation for: $identifier ===")
         Log.i("WasmPageCalculator", "HTML size: ${html.length} chars")
         Log.i("WasmPageCalculator", "Text content length: $contentLength chars")
-        Log.i(
-            "WasmPageCalculator",
-            "Viewport: ${samplingData.viewportWidth} x ${samplingData.viewportHeight}"
-        )
-        Log.i("WasmPageCalculator", "Font size: ${samplingData.fontMetrics.fontSize}")
-        Log.i("WasmPageCalculator", "Line height: ${samplingData.fontMetrics.lineHeight}")
-        Log.i("WasmPageCalculator", "Character width: ${samplingData.fontMetrics.characterWidth}")
-        Log.i(
-            "WasmPageCalculator",
-            "Content area: ${samplingData.layoutMetrics.contentWidth} x ${samplingData.layoutMetrics.contentHeight}"
-        )
+        Log.i("WasmPageCalculator", "Viewport: $viewportWidth x $viewportHeight")
+        Log.i("WasmPageCalculator", "Font size: $fontSize")
+        Log.i("WasmPageCalculator", "Line height: $lineHeight")
+        Log.i("WasmPageCalculator", "Character width: $characterWidth")
+        Log.i("WasmPageCalculator", "Content area: $contentWidth x $contentHeight")
         Log.i("WasmPageCalculator", "Chars per line: $charsPerLine")
         Log.i("WasmPageCalculator", "Lines per page: $linesPerPage")
         Log.i("WasmPageCalculator", "Chars per page: $charsPerPage")

@@ -1,6 +1,160 @@
 use wasm_bindgen::prelude::*;
 use web_sys::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
+use std::collections::HashMap;
+
+/// CSS 길이 문자열을 f64(px)로 파싱 (예: "12px" → 12.0)
+fn parse_css_px(value: &str) -> f64 {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "auto" { return 0.0; }
+    let no_px = trimmed.strip_suffix("px").unwrap_or(trimmed);
+    no_px.parse::<f64>().unwrap_or(0.0)
+}
+
+/// 컨테이너의 첫/마지막 요소의 바깥 마진(px)을 계산
+/// 웹뷰의 body 가장자리에서 발생하는 마진 병합을 보정하기 위해 사용
+fn compute_outer_margins(document: &Document, window: &Window, container: &Element) -> (f64, f64) {
+    // 첫 요소
+    let mut first_top_margin = 0.0;
+    let mut current = container.first_element_child();
+    let mut depth_guard = 0;
+    while let Some(elem) = current {
+        if depth_guard > 32 { break; } // 안전 가드
+        depth_guard += 1;
+        if let Ok(Some(style)) = window.get_computed_style(&elem) {
+            let mt = style.get_property_value("margin-top").unwrap_or_default();
+            let display = style.get_property_value("display").unwrap_or_default();
+            let position = style.get_property_value("position").unwrap_or_default();
+            // in-flow block으로 간주되는 경우만 카운트
+            if display != "none" && position != "absolute" && position != "fixed" {
+                let mt_px = parse_css_px(&mt);
+                if mt_px > 0.0 || elem.first_element_child().is_none() {
+                    first_top_margin = mt_px;
+                    break;
+                }
+            }
+        }
+        current = elem.first_element_child();
+    }
+
+    // 마지막 요소
+    let mut last_bottom_margin = 0.0;
+    let mut current_last = container.last_element_child();
+    let mut depth_guard_last = 0;
+    while let Some(elem) = current_last {
+        if depth_guard_last > 32 { break; }
+        depth_guard_last += 1;
+        if let Ok(Some(style)) = window.get_computed_style(&elem) {
+            let mb = style.get_property_value("margin-bottom").unwrap_or_default();
+            let display = style.get_property_value("display").unwrap_or_default();
+            let position = style.get_property_value("position").unwrap_or_default();
+            if display != "none" && position != "absolute" && position != "fixed" {
+                let mb_px = parse_css_px(&mb);
+                if mb_px > 0.0 || elem.last_element_child().is_none() {
+                    last_bottom_margin = mb_px;
+                    break;
+                }
+            }
+        }
+        current_last = elem.last_element_child();
+    }
+
+    (first_top_margin, last_bottom_margin)
+}
+
+/// 첫/마지막 실제 렌더 박스를 이용해 여분 갭(px)을 계산
+/// - top_gap = first_content_rect.top - container_rect.top
+/// - bottom_gap = container_rect.bottom - last_content_rect.bottom
+fn compute_outer_gaps_by_geometry(window: &Window, container: &Element) -> (f64, f64) {
+    let container_rect = container.get_bounding_client_rect();
+    let mut first_rect_top: Option<f64> = None;
+    let mut last_rect_bottom: Option<f64> = None;
+
+    // 후손 모두 탐색해 in-flow 박스의 첫/마지막을 찾음
+    if let Ok(node_list) = container.query_selector_all(":scope *") {
+        let length = node_list.length();
+        for i in 0..length {
+            if let Some(node) = node_list.item(i) {
+                if let Some(elem) = node.dyn_ref::<Element>() {
+                    if let Ok(Some(style)) = window.get_computed_style(elem) {
+                        let display = style.get_property_value("display").unwrap_or_default();
+                        let position = style.get_property_value("position").unwrap_or_default();
+                        if display == "none" || position == "absolute" || position == "fixed" {
+                            continue;
+                        }
+                        let rect = elem.get_bounding_client_rect();
+                        if rect.width() > 0.0 && rect.height() > 0.0 {
+                            if first_rect_top.is_none() {
+                                first_rect_top = Some(rect.top());
+                            }
+                            last_rect_bottom = Some(rect.bottom());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let top_gap = first_rect_top.map(|t| (t - container_rect.top()).max(0.0)).unwrap_or(0.0);
+    let bottom_gap = last_rect_bottom.map(|b| (container_rect.bottom() - b).max(0.0)).unwrap_or(0.0);
+    (top_gap, bottom_gap)
+}
+
+// Custom deserializer for string to i32
+fn string_to_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        String(String),
+        Int(i32),
+    }
+
+    match StringOrInt::deserialize(deserializer)? {
+        StringOrInt::String(s) => s.parse().map_err(serde::de::Error::custom),
+        StringOrInt::Int(i) => Ok(i),
+    }
+}
+
+// Custom deserializer for string to f32 (flexible - handles string, float, or int)
+fn flexible_f32<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleNumber {
+        String(String),
+        Float(f32),
+        Int(i32),
+    }
+
+    match FlexibleNumber::deserialize(deserializer)? {
+        FlexibleNumber::String(s) => s.parse().map_err(serde::de::Error::custom),
+        FlexibleNumber::Float(f) => Ok(f),
+        FlexibleNumber::Int(i) => Ok(i as f32),
+    }
+}
+
+// Optional string to i32 (handles both string and int inputs)
+fn opt_string_to_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        String(String),
+        Int(i32),
+    }
+
+    match StringOrInt::deserialize(deserializer)? {
+        StringOrInt::String(s) => s.parse().map_err(serde::de::Error::custom),
+        StringOrInt::Int(i) => Ok(i),
+    }
+}
 
 // 초기화 시 panic hook 설정
 #[wasm_bindgen(start)]
@@ -19,6 +173,93 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
+/// 주입된 CSS가 실제로 적용되었는지 확인하기 위한 디버그 로거
+fn debug_log_computed_styles(window: &Window, container: &Element) {
+    // 컨테이너 자체 스타일
+    if let Ok(Some(cs)) = window.get_computed_style(container) {
+        let bx = cs.get_property_value("box-sizing").unwrap_or_default();
+        let ff = cs.get_property_value("font-family").unwrap_or_default();
+        let fs = cs.get_property_value("font-size").unwrap_or_default();
+        let lh = cs.get_property_value("line-height").unwrap_or_default();
+        let mt = cs.get_property_value("margin-top").unwrap_or_default();
+        let mb = cs.get_property_value("margin-bottom").unwrap_or_default();
+        let pad_left = cs.get_property_value("padding-left").unwrap_or_default();
+        let pad_right = cs.get_property_value("padding-right").unwrap_or_default();
+        let hy = cs.get_property_value("hyphens").unwrap_or_default();
+        let ls = cs.get_property_value("letter-spacing").unwrap_or_default();
+        let ws = cs.get_property_value("word-spacing").unwrap_or_default();
+        let rs_gutter = cs.get_property_value("--RS__pageGutter").unwrap_or_default();
+        let rs_mll = cs.get_property_value("--RS__maxLineLength").unwrap_or_default();
+        console_log!(
+            "🔍 [container] box-sizing={}, font={}, font-size={}, line-height={}, mt={}, mb={}, padding-left={}, padding-right={}, hyphens={}, letter-spacing={}, word-spacing={}, --RS__pageGutter={}, --RS__maxLineLength={}",
+            bx, ff, fs, lh, mt, mb, pad_left, pad_right, hy, ls, ws, rs_gutter, rs_mll
+        );
+    }
+
+    // 첫 번째 in-flow 자손 엘리먼트 스타일
+    if let Ok(Some(first)) = container.query_selector(":scope p, :scope h1, :scope h2, :scope h3, :scope h4, :scope h5, :scope h6, :scope div, :scope section, :scope article, :scope blockquote, :scope ul, :scope ol, :scope li, :scope figure") {
+        if let Some(first_el) = first.dyn_ref::<Element>() {
+            if let Ok(Some(cs)) = window.get_computed_style(first_el) {
+                let tag = first_el.tag_name();
+                let ff = cs.get_property_value("font-family").unwrap_or_default();
+                let fs = cs.get_property_value("font-size").unwrap_or_default();
+                let lh = cs.get_property_value("line-height").unwrap_or_default();
+                let mt = cs.get_property_value("margin-top").unwrap_or_default();
+                let mb = cs.get_property_value("margin-bottom").unwrap_or_default();
+                let pad_left = cs.get_property_value("padding-left").unwrap_or_default();
+                let pad_right = cs.get_property_value("padding-right").unwrap_or_default();
+                let hy = cs.get_property_value("hyphens").unwrap_or_default();
+                let ls = cs.get_property_value("letter-spacing").unwrap_or_default();
+                let ws = cs.get_property_value("word-spacing").unwrap_or_default();
+                console_log!(
+                    "🔍 [first:{}] font={}, font-size={}, line-height={}, mt={}, mb={}, padding-left={}, padding-right={}, hyphens={}, letter-spacing={}, word-spacing={}",
+                    tag, ff, fs, lh, mt, mb, pad_left, pad_right, hy, ls, ws
+                );
+            }
+        }
+    }
+}
+
+/// CSS 변수를 :root(html)에도 적용하여 상속 기반 규칙이 정상 동작하도록 함
+fn apply_css_variables_to_root(document: &Document, variables: &HashMap<String, String>) {
+    if let Some(root) = document.document_element() {
+        if let Some(root_el) = root.dyn_ref::<HtmlElement>() {
+            let root_style = root_el.style();
+            for (key, value) in variables {
+                let _ = root_style.set_property(key, value);
+                console_log!("set {} = {}", key, value);
+            }
+        }
+    }
+}
+
+/// :root와 body의 주요 computed style을 로깅하여 전역 CSS 적용 확인
+fn debug_log_root_body(window: &Window, document: &Document) {
+    if let Some(root) = document.document_element() {
+        if let Ok(Some(cs)) = window.get_computed_style(&root) {
+            let ff = cs.get_property_value("font-family").unwrap_or_default();
+            let fs = cs.get_property_value("font-size").unwrap_or_default();
+            let lh = cs.get_property_value("line-height").unwrap_or_default();
+            let pad_left = cs.get_property_value("padding-left").unwrap_or_default();
+            let pad_right = cs.get_property_value("padding-right").unwrap_or_default();
+            let rs_gutter = cs.get_property_value("--RS__pageGutter").unwrap_or_default();
+            let rs_mll = cs.get_property_value("--RS__maxLineLength").unwrap_or_default();
+            console_log!("🔍 [:root] font={}, font-size={}, line-height={}, padding-left={}, padding-right={}", ff, fs, lh, pad_left, pad_right);
+            console_log!("🔍 [:root] --RS__pageGutter={}, --RS__maxLineLength={}", rs_gutter, rs_mll);
+        }
+    }
+    if let Some(body) = document.body() {
+        if let Ok(Some(cs)) = window.get_computed_style(&body) {
+            let ff = cs.get_property_value("font-family").unwrap_or_default();
+            let fs = cs.get_property_value("font-size").unwrap_or_default();
+            let lh = cs.get_property_value("line-height").unwrap_or_default();
+            let pad_left = cs.get_property_value("padding-left").unwrap_or_default();
+            let pad_right = cs.get_property_value("padding-right").unwrap_or_default();
+            console_log!("🔍 [body] font={}, font-size={}, line-height={}, padding-left={}, padding-right={}", ff, fs, lh, pad_left, pad_right);
+        }
+    }
+}
+
 /// 샘플링 데이터 구조체 (Kotlin과 동일)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SamplingData {
@@ -28,34 +269,67 @@ pub struct SamplingData {
     pub viewport_height: i32,
     #[serde(rename = "fontMetrics")]
     pub font_metrics: FontMetrics,
-    #[serde(rename = "layoutMetrics")]
-    pub layout_metrics: LayoutMetrics,
+    #[serde(rename = "cssVariables")]
+    pub css_variables: CssVariables,
+    #[serde(rename = "elementStyles")]
+    pub element_styles: HashMap<String, HashMap<String, String>>,
+    #[serde(rename = "bodyStyle")]
+    pub body_style: Option<BodyStyle>,
+    #[serde(rename = "rootStyleAttr")]
+    pub root_style_attr: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FontMetrics {
     #[serde(rename = "fontSize")]
+    #[serde(deserialize_with = "flexible_f32")]
     pub font_size: f32,
     #[serde(rename = "lineHeight")]
+    #[serde(deserialize_with = "flexible_f32")]
     pub line_height: f32,
     #[serde(rename = "characterWidth")]
+    #[serde(deserialize_with = "flexible_f32")]
     pub character_width: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct LayoutMetrics {
+pub struct CssVariables {
+    #[serde(flatten)]
+    pub vars: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BodyStyle {
     #[serde(rename = "contentWidth")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
     pub content_width: i32,
     #[serde(rename = "contentHeight")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
     pub content_height: i32,
     #[serde(rename = "marginTop")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
     pub margin_top: i32,
+    #[serde(rename = "marginRight")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
+    pub margin_right: i32,
     #[serde(rename = "marginBottom")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
     pub margin_bottom: i32,
     #[serde(rename = "marginLeft")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
     pub margin_left: i32,
-    #[serde(rename = "marginRight")]
-    pub margin_right: i32,
+    #[serde(rename = "paddingTop")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
+    pub padding_top: i32,
+    #[serde(rename = "paddingRight")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
+    pub padding_right: i32,
+    #[serde(rename = "paddingBottom")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
+    pub padding_bottom: i32,
+    #[serde(rename = "paddingLeft")]
+    #[serde(deserialize_with = "opt_string_to_i32")]
+    pub padding_left: i32,
 }
 
 /// 페이지 계산 결과 구조체
@@ -70,8 +344,17 @@ pub struct PageCalculationResult {
 #[wasm_bindgen]
 pub fn calculate_pages(html: &str, sampling_data_json: &str) -> String {
     console_log!("🦀 WASM calculate_pages 호출됨");
+    // Backward compatibility: no external CSS provided
+    calculate_pages_with_css(html, "", sampling_data_json)
+}
+
+/// WASM에서 호출될 메인 함수 - 페이지 수 계산 (외부 CSS 포함)
+#[wasm_bindgen]
+pub fn calculate_pages_with_css(html: &str, css_text: &str, sampling_data_json: &str) -> String {
+    console_log!("🦀 WASM calculate_pages_with_css 호출됨");
     console_log!("HTML 길이: {} chars", html.len());
     console_log!("샘플링 데이터: {}", sampling_data_json);
+    console_log!("🎨 외부 CSS 길이: {} chars", css_text.len());
 
     // JSON 파싱
     let sampling_data: SamplingData = match serde_json::from_str(sampling_data_json) {
@@ -86,8 +369,12 @@ pub fn calculate_pages(html: &str, sampling_data_json: &str) -> String {
         }
     };
 
-    // 페이지 계산 실행
-    let result = calculate_pages_internal(html, &sampling_data);
+    // 페이지 계산 실행 (외부 CSS 유무에 따라 분기)
+    let result = if css_text.is_empty() {
+        calculate_pages_internal(html, &sampling_data)
+    } else {
+        calculate_pages_internal_with_css(html, css_text, &sampling_data)
+    };
     
     console_log!("✅ 계산 완료: {} pages", result.total_pages);
 
@@ -95,8 +382,8 @@ pub fn calculate_pages(html: &str, sampling_data_json: &str) -> String {
     serde_json::to_string(&result).unwrap_or_default()
 }
 
-/// 실제 페이지 계산 로직
-fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCalculationResult {
+/// 외부 CSS가 있는 경우의 페이지 계산 로직
+fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: &SamplingData) -> PageCalculationResult {
     console_log!("🧮 페이지 계산 시작");
 
     let window = match window() {
@@ -133,51 +420,130 @@ fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCal
         }
     };
 
+    // 래퍼 생성 (뷰포트 폭 고정 + 오프스크린 고정 배치)
+    let wrapper = match document.create_element("div") {
+        Ok(elem) => elem,
+        Err(_) => {
+            console_log!("❌ 래퍼 엘리먼트 생성 실패");
+            return PageCalculationResult {
+                total_pages: 1,
+                status: "ERROR".to_string(),
+            };
+        }
+    };
+
     // HTML 콘텐츠 설정
     container.set_inner_html(html);
 
     // CSS 스타일 적용
     let html_element = container.dyn_ref::<HtmlElement>().unwrap();
     let style = html_element.style();
-
-    // 기본 레이아웃 스타일
-    let _ = style.set_property("position", "absolute");
-    let _ = style.set_property("visibility", "hidden");
-    let _ = style.set_property("top", "-9999px");
-    let _ = style.set_property("left", "-9999px");
-    let _ = style.set_property("width", &format!("{}px", sampling_data.layout_metrics.content_width));
-    let _ = style.set_property("height", "auto");
-    let _ = style.set_property("overflow", "visible");
-
-    // Readium CSS 기본 스타일 적용
-    let _ = style.set_property("font-family", "\"Iowan Old Style\",\"Sitka Text\",Palatino,\"Book Antiqua\",serif");
-    let _ = style.set_property("font-size", &format!("{}px", sampling_data.font_metrics.font_size));
-    let _ = style.set_property("line-height", &format!("{}px", sampling_data.font_metrics.line_height));
-    let _ = style.set_property("text-rendering", "optimizeLegibility");
-    let _ = style.set_property("color", "#121212");
-    let _ = style.set_property("background-color", "#FFFFFF");
     
-    // 마진/패딩 적용
-    if sampling_data.layout_metrics.margin_top > 0 {
-        let _ = style.set_property("padding-top", &format!("{}px", sampling_data.layout_metrics.margin_top));
-    }
-    if sampling_data.layout_metrics.margin_bottom > 0 {
-        let _ = style.set_property("padding-bottom", &format!("{}px", sampling_data.layout_metrics.margin_bottom));
-    }
-    if sampling_data.layout_metrics.margin_left > 0 {
-        let _ = style.set_property("padding-left", &format!("{}px", sampling_data.layout_metrics.margin_left));
-    }
-    if sampling_data.layout_metrics.margin_right > 0 {
-        let _ = style.set_property("padding-right", &format!("{}px", sampling_data.layout_metrics.margin_right));
+    // wrapper 스타일 핸들
+    let wrapper_html = wrapper.dyn_ref::<HtmlElement>().unwrap();
+    let wrapper_style = wrapper_html.style();
+    
+    // container div에 식별 속성 추가 (CSS 선택자용)
+    html_element.set_attribute("data-wasm-container", "true").unwrap_or_default();
+    // wrapper에도 식별자 추가
+    wrapper_html.set_attribute("data-wasm-wrapper", "true").unwrap_or_default();
+
+    // 컨테이너는 body와 유사하게 동작하도록 최소한만 지정 (나머지는 스타일시트로 오버라이드)
+    let _ = style.set_property("display", "block");
+    let _ = style.set_property("box-sizing", "border-box");
+    let _ = style.set_property("width", "100%");
+
+    // 기본 레이아웃 스타일 (이전: 컨테이너에 적용하던 오프스크린 고정 → 이제 래퍼에 적용)
+    // wrapper를 오프스크린 고정 + 뷰포트 폭 고정
+    wrapper_style.set_css_text(&format!(
+        "position:fixed !important; \
+         top:-10000px !important; \
+         left:0 !important; \
+         visibility:hidden !important; \
+         display:block !important; \
+         box-sizing:content-box !important; \
+         width:{}px !important; \
+         max-width:none !important; \
+         min-width:0 !important; \
+         overflow:visible !important;",
+        sampling_data.viewport_width
+    ));
+    
+    // 기본값 설정 (body_style이 없을 경우 대비)
+    let mut actual_padding_left = 0;
+    let mut actual_padding_right = 0;
+    let mut actual_padding_top = 0;
+    let mut actual_padding_bottom = 0;
+    let mut actual_margin_top = 0;
+    let mut actual_margin_bottom = 0;
+    let mut pure_content_width = sampling_data.viewport_width;
+    let mut total_width_including_padding = pure_content_width;
+    
+    if let Some(body_style) = &sampling_data.body_style {
+        actual_padding_left = body_style.padding_left;
+        actual_padding_right = body_style.padding_right;
+        actual_padding_top = body_style.padding_top;
+        actual_padding_bottom = body_style.padding_bottom;
+        actual_margin_top = body_style.margin_top;
+        actual_margin_bottom = body_style.margin_bottom;
+        
+        total_width_including_padding = body_style.content_width;
+        
+        console_log!("📐 너비 분석:");
+        console_log!("  - contentWidth (WebView 측정): {}px", total_width_including_padding);
+        console_log!("  - contentHeight (WebView 측정): {}px", body_style.content_height);
+        console_log!("  - paddingLeft: {}px", actual_padding_left);
+        console_log!("  - paddingRight: {}px", actual_padding_right);
+        console_log!("  - 총 좌우 패딩: {}px", actual_padding_left + actual_padding_right);
+        
+        let total_horizontal_padding = actual_padding_left + actual_padding_right;
+        pure_content_width = if total_horizontal_padding > 0 {
+            total_width_including_padding - total_horizontal_padding
+        } else {
+            total_width_including_padding
+        };
+        
+        console_log!("📐 패딩 중복 방지 계산:");
+        console_log!("  - 전체 너비 (padding 포함): {}px", total_width_including_padding);
+        console_log!("  - 총 좌우 패딩: {}px", total_horizontal_padding);
+        console_log!("  - 순수 콘텐츠 너비: {}px", pure_content_width);
+        console_log!("📐 최종 적용 너비(콘텐츠 기준): {}px (폭/박스모델은 베이스라인 측정 후 적용)", pure_content_width);
     }
 
-    // 박스 모델 설정
-    let _ = style.set_property("box-sizing", "border-box");
-    let _ = style.set_property("word-wrap", "break-word");
+    // 외부 CSS 제공됨 → 인라인 타이포그래피 적용 생략
+    console_log!("🎨 외부 CSS 제공됨 → 폰트/라인높이 인라인 적용 생략");
+    
+    // 스타일 요소 생성 및 외부 CSS만 주입
+    let para_style = document.create_element("style").unwrap();
+    let mut css_rules = String::new();
+    css_rules.push_str(css_text);
+    css_rules.push('\n');
+    console_log!("🎨 외부 CSS만 주입");
+    
+    // 생성된 CSS 규칙을 스타일 요소에 설정
+    para_style.set_inner_html(&css_rules);
 
     // DOM에 추가하여 실제 레이아웃 계산 수행
     if let Some(body) = document.body() {
-        if let Err(_) = body.append_child(&container) {
+        // :root style 토글 복제는 반드시 측정 전에 적용되어야 함
+        let root_el = document.document_element();
+        let mut prev_root_style: Option<String> = None;
+        if let Some(root) = &root_el {
+            prev_root_style = root.get_attribute("style");
+            if let Some(style_attr) = &sampling_data.root_style_attr {
+                let _ = root.set_attribute("style", style_attr);
+                console_log!("🧭 :root style 복제 적용: {}", style_attr);
+            }
+        }
+        
+        if let Err(_) = wrapper.append_child(&container) {
+            console_log!("❌ 래퍼에 컨테이너 추가 실패");
+            return PageCalculationResult {
+                total_pages: 1,
+                status: "ERROR".to_string(),
+            };
+        }
+        if let Err(_) = body.append_child(&wrapper) {
             console_log!("❌ DOM 추가 실패");
             return PageCalculationResult {
                 total_pages: 1,
@@ -185,23 +551,132 @@ fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCal
             };
         }
 
-        // 실제 높이 측정
-        let actual_height = html_element.offset_height();
-        console_log!("📏 실제 높이: {}px", actual_height);
+        // A) 베이스라인 측정: 레이아웃에 영향이 큰 속성 적용 전
+        console_log!("📏 === 높이 측정 분석 시작 ===");
+        let rect_a = html_element.get_bounding_client_rect();
+        let width_a = rect_a.width();
+        let height_a = rect_a.height();
+        console_log!("📏 A 베이스라인 높이: {:.3}px, width: {:.3}px", height_a, width_a);
+
+        // B) width/box-sizing만 적용 → 래퍼가 담당하므로 래퍼 스타일만 유지
+        // (이미 wrapper_style에 적용되어 있음)
+        let rect_b = html_element.get_bounding_client_rect();
+        let width_b = rect_b.width();
+        let height_b = rect_b.height();
+        console_log!("📏 B width/box 적용 후: {:.3}px (ΔA→B: {:.3}px), width: {:.3}px", height_b, height_b - height_a, width_b);
+
+        // C) 타이포그래피 인라인 적용은 생략 (외부 CSS 사용)
+        let rect_c = html_element.get_bounding_client_rect();
+        let height_c = rect_c.height();
+        console_log!("📏 C 타이포 적용 생략: {:.3}px (ΔB→C: {:.3}px, 누적 ΔA→C: {:.3}px)", height_c, height_c - height_b, height_c - height_a);
+
+
+        // CSS 변수 적용
+        for (key, value) in &sampling_data.css_variables.vars {
+            //let _ = style.set_property(key, value);
+        }
+        // :root에도 동일 변수 적용 (전역 규칙의 var() 해석용)
+        apply_css_variables_to_root(&document, &sampling_data.css_variables.vars);
+        
+        // D) 스타일시트 주입 + CSS 변수 적용
+        let head = document.get_elements_by_tag_name("head").get_with_index(0);
+        if let Some(head) = head {
+            let _ = head.append_child(&para_style);
+            console_log!("🎨 외부 CSS 적용 완료");
+        }
+        
+        // 컨테이너 스코프에서 타이포그래피/바디 레이아웃 보정 규칙 추가
+        if let Some(sheet_el) = para_style.dyn_ref::<HtmlElement>() {
+            let mut scoped = String::new();
+            scoped.push_str(r#"
+            div[data-wasm-container] {
+                /* USER 우선 적용 */
+                font-family: var(--USER__fontFamily, var(--RS__baseFontFamily)) !important;
+                font-size: var(--USER__fontSize, 100%) !important;
+                line-height: var(--USER__lineHeight, var(--RS__baseLineHeight)) !important;
+
+                /* 페이지 거터 = RS__pageGutter × USER__pageMargins */
+                padding-left:  calc(var(--RS__pageGutter) * var(--USER__pageMargins, 1)) !important;
+                padding-right: calc(var(--RS__pageGutter) * var(--USER__pageMargins, 1)) !important;
+
+                /* 스페이싱/하이픈 (읽기 설정 반영) */
+                letter-spacing: var(--USER__letterSpacing, normal) !important;
+                word-spacing:   var(--USER__wordSpacing, 0px) !important;
+                hyphens: var(--USER__bodyHyphens, manual) !important;
+
+                /* 나머지 레이아웃 */
+                width: 100% !important;
+                max-width: var(--RS__maxLineLength) !important;
+                margin-left: auto !important;
+                margin-right: auto !important;
+                box-sizing: border-box !important;
+                column-width: auto !important;
+                column-count: auto !important;
+                column-gap: normal !important;
+            }
+            /* 미디어/테이블(안전망) */
+            div[data-wasm-container] img,
+            div[data-wasm-container] svg,
+            div[data-wasm-container] video,
+            div[data-wasm-container] audio {
+                object-fit: contain !important;
+                width: auto !important;
+                height: auto !important;
+                max-width: var(--RS__maxMediaWidth, 100%) !important;
+                max-height: var(--RS__maxMediaHeight, 95vh) !important;
+                box-sizing: var(--RS__boxSizingMedia, border-box) !important;
+            }
+            div[data-wasm-container] table {
+                max-width: var(--RS__maxMediaWidth, 100%) !important;
+                box-sizing: var(--RS__boxSizingTable, border-box) !important;
+            }
+            "#);
+            // 기존 규칙 뒤에 추가 주입
+            let new_inner = format!("{}\n{}", para_style.inner_html(), scoped);
+            sheet_el.set_inner_html(&new_inner);
+        }
+
+        // CSS 적용 상태 디버그 로그
+        debug_log_root_body(&window, &document);
+        debug_log_computed_styles(&window, &container);
+
+        let rect_d = html_element.get_bounding_client_rect();
+        let width_d = rect_d.width();
+        let height_d = rect_d.height();
+        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px), width: {:.3}px", height_d, height_d - height_c, height_d - height_a, width_d);
+
+        let measured_height = html_element.scroll_height() as f64;
+        console_log!("📏 최종 측정된 높이 (보정 포함): {:.3}px", measured_height);
+
+        // 실제 높이 측정 및 보정
+        console_log!("📏 === 높이 측정 분석 완료 ===");
         
         let page_height = sampling_data.viewport_height as f64;
         console_log!("📄 페이지 높이: {}px (뷰포트 높이 사용)", page_height);
 
         // DOM에서 제거
-        let _ = body.remove_child(&container);
+        let _ = body.remove_child(&wrapper);
+        // 스타일 제거
+        if let Some(head) = document.get_elements_by_tag_name("head").get_with_index(0) {
+            let _ = head.remove_child(&para_style);
+        }
 
         // 페이지 수 계산 (올림 처리)
         if page_height > 0.0 {
-            let total_pages = ((actual_height as f64) / page_height).ceil() as i32;
+            let total_pages = ((measured_height as f64) / page_height).ceil() as i32;
             let final_pages = total_pages.max(1);
             
             console_log!("✅ 계산된 페이지 수: {}", final_pages);
             
+            // :root style 원복
+            if let Some(root) = root_el {
+                match prev_root_style {
+                    Some(orig) => { let _ = root.set_attribute("style", &orig); },
+                    None => { let _ = root.remove_attribute("style"); }
+                }
+                console_log!("🧭 :root style 원복 완료");
+            }
+
             PageCalculationResult {
                 total_pages: final_pages,
                 status: "SUCCESS".to_string(),
@@ -220,6 +695,444 @@ fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCal
             status: "ERROR".to_string(),
         }
     }
+}
+
+/// 외부 CSS가 없는 경우(샘플링 기반 fallback)의 페이지 계산 로직
+fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCalculationResult {
+    console_log!("🧮 (fallback) 페이지 계산 시작 - 외부 CSS 없음");
+
+    let window = match window() {
+        Some(w) => w,
+        None => {
+            console_log!("❌ Window 객체를 찾을 수 없음");
+            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
+        }
+    };
+
+    let document = match window.document() {
+        Some(d) => d,
+        None => {
+            console_log!("❌ Document 객체를 찾을 수 없음");
+            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
+        }
+    };
+
+    // 컨테이너 준비
+    let container = match document.create_element("div") {
+        Ok(elem) => elem,
+        Err(_) => {
+            console_log!("❌ 컨테이너 엘리먼트 생성 실패");
+            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
+        }
+    };
+    container.set_inner_html(html);
+
+    let html_element = container.dyn_ref::<HtmlElement>().unwrap();
+    let style = html_element.style();
+    html_element.set_attribute("data-wasm-container", "true").unwrap_or_default();
+
+    let _ = style.set_property("display", "block");
+    let _ = style.set_property("box-sizing", "border-box");
+    let _ = style.set_property("width", "100%");
+
+    // 너비 계산 (샘플링된 body 스타일 기준)
+    let mut pure_content_width = sampling_data.viewport_width;
+    if let Some(body_style) = &sampling_data.body_style {
+        let total_horizontal_padding = body_style.padding_left + body_style.padding_right;
+        let total_width_including_padding = body_style.content_width;
+        pure_content_width = if total_horizontal_padding > 0 {
+            total_width_including_padding - total_horizontal_padding
+        } else {
+            total_width_including_padding
+        };
+        console_log!("📐 (fallback) 순수 콘텐츠 너비: {}px", pure_content_width);
+    }
+
+    // 샘플링 데이터 기반 폰트 패밀리
+    let actual_font_family = if let Some(body_styles) = sampling_data.element_styles.get("body") {
+        if let Some(font_family) = body_styles.get("fontFamily") {
+            font_family.clone()
+        } else {
+            "\"Iowan Old Style\",\"Sitka Text\",Palatino,\"Book Antiqua\",serif".to_string()
+        }
+    } else {
+        "\"Iowan Old Style\",\"Sitka Text\",Palatino,\"Book Antiqua\",serif".to_string()
+    };
+    console_log!("🎨 (fallback) 폰트 패밀리 적용: {}", actual_font_family);
+
+    // 스타일 요소 생성: elementStyles 전부를 스코프에 맞춰 주입
+    let para_style = document.create_element("style").unwrap();
+    let mut css_rules = String::new();
+
+    for (tag_name, styles) in &sampling_data.element_styles {
+        let font_family = styles.get("fontFamily").unwrap_or(&actual_font_family).clone();
+        let font_size = styles.get("fontSize")
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(sampling_data.font_metrics.font_size);
+        let line_height = styles.get("lineHeight")
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(sampling_data.font_metrics.line_height);
+        let font_weight = styles.get("fontWeight").map_or("400", |v| v).clone();
+        
+        let margin_top = styles.get("marginTop").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let margin_bottom = styles.get("marginBottom").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let margin_left = styles.get("marginLeft").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let margin_right = styles.get("marginRight").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+
+        let padding_top = styles.get("paddingTop").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let padding_bottom = styles.get("paddingBottom").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let padding_left = styles.get("paddingLeft").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let padding_right = styles.get("paddingRight").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+
+        let text_indent = styles.get("textIndent").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let letter_spacing = styles.get("letterSpacing").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let word_spacing = styles.get("wordSpacing").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+
+        let text_align = styles.get("textAlign").map_or("left", |v| v);
+        let display = styles.get("display").map_or("block", |v| v);
+        let white_space = styles.get("whiteSpace").map_or("normal", |v| v);
+
+        let tag_css = format!(
+            r#"div[data-wasm-container] {} {{
+                    margin: {}px {}px {}px {}px;
+                    padding: {}px {}px {}px {}px;
+                    font-size: {}px;
+                    line-height: var(--RS__baseLineHeight, {}px);
+                    font-family: {};
+                    font-weight: {};
+                    text-align: {};
+                    text-indent: {}px;
+                    letter-spacing: {}px;
+                    word-spacing: {}px;
+                    display: {};
+                    white-space: {};
+                }}
+                "#,
+            tag_name,
+            margin_top, margin_right, margin_bottom, margin_left,
+            padding_top, padding_right, padding_bottom, padding_left,
+            font_size, line_height, font_family, font_weight,
+            text_align, text_indent, letter_spacing, word_spacing,
+            display, white_space
+        );
+        css_rules.push_str(&tag_css);
+    }
+
+    // container padding/margin도 fallback으로 적용
+    if let Some(body_style) = &sampling_data.body_style {
+        let container_css = format!(
+            r#"
+                div[data-wasm-container] {{
+                    padding: {}px {}px {}px {}px !important;
+                    margin: {}px {}px {}px {}px !important;
+                    box-sizing: content-box !important;
+                }}
+                "#,
+            body_style.padding_top, body_style.padding_right, body_style.padding_bottom, body_style.padding_left,
+            body_style.margin_top, body_style.margin_right, body_style.margin_bottom, body_style.margin_left
+        );
+        css_rules.push_str(&container_css);
+    }
+
+    para_style.set_inner_html(&css_rules);
+
+    // flow spacing 변수
+    let flow_spacing = if let Some(body_style) = &sampling_data.body_style {
+        if body_style.padding_top > 0 || body_style.padding_bottom > 0 {
+            (body_style.padding_top + body_style.padding_bottom) / 2
+        } else { 24 }
+    } else { 24 };
+    let _ = style.set_property("--RS__flowSpacing", &format!("{}px", flow_spacing));
+
+    // DOM에 추가 후 측정
+    if let Some(body) = document.body() {
+        if let Err(_) = body.append_child(&container) {
+            console_log!("❌ DOM 추가 실패");
+            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
+        }
+
+        // A) 베이스라인
+        console_log!("📏 === 높이 측정 분석 시작 (fallback) ===");
+        let rect_a = html_element.get_bounding_client_rect();
+        let height_a = rect_a.height();
+        console_log!("📏 A 베이스라인 높이: {:.3}px", height_a);
+
+        // B) width/box-sizing
+        let _ = style.set_property("box-sizing", "content-box");
+        let _ = style.set_property("width", &format!("{}px", pure_content_width));
+        let _ = style.set_property("height", "auto");
+        let rect_b = html_element.get_bounding_client_rect();
+        let height_b = rect_b.height();
+        console_log!("📏 B width/box 적용 후: {:.3}px (ΔA→B: {:.3}px)", height_b, height_b - height_a);
+
+        // C) 인라인 타이포그래피 적용
+        let _ = style.set_property("font-family", &actual_font_family);
+        let _ = style.set_property("font-size", &format!("{}px", sampling_data.font_metrics.font_size));
+        let _ = style.set_property("line-height", &format!("{}px", sampling_data.font_metrics.line_height));
+        let _ = style.set_property("text-rendering", "optimizeLegibility");
+        let rect_c = html_element.get_bounding_client_rect();
+        let height_c = rect_c.height();
+        console_log!("📏 C 타이포 적용 후: {:.3}px (ΔB→C: {:.3}px, 누적 ΔA→C: {:.3}px)", height_c, height_c - height_b, height_c - height_a);
+
+        // D) 스타일시트 주입 + CSS 변수 적용
+        let head = document.get_elements_by_tag_name("head").get_with_index(0);
+        if let Some(head) = head {
+            let _ = head.append_child(&para_style);
+            console_log!("🎨 element 스타일 적용 완료 (fallback)");
+        }
+
+        // CSS 변수 적용
+        for (key, value) in &sampling_data.css_variables.vars {
+            let _ = style.set_property(key, value);
+        }
+        // :root에도 동일 변수 적용 (전역 규칙의 var() 해석용)
+        apply_css_variables_to_root(&document, &sampling_data.css_variables.vars);
+
+        // CSS 적용 상태 디버그 로그
+        debug_log_root_body(&window, &document);
+        debug_log_computed_styles(&window, &container);
+
+        let rect_d = html_element.get_bounding_client_rect();
+        let height_d = rect_d.height();
+        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px)", height_d, height_d - height_c, height_d - height_a);
+
+        // 웹뷰 측정치(body 가장자리 마진 병합) 보정 (1차: computed style 기반)
+        let (mt_first, mb_last) = compute_outer_margins(&document, &window, &container);
+        let mut subtract_by = mt_first + mb_last;
+        if subtract_by > 0.0 {
+            console_log!("🔧 가장자리 마진 보정[computed]: top {:.3}px + bottom {:.3}px = {:.3}px", mt_first, mb_last, subtract_by);
+        }
+
+        // 보정값이 0일 경우, 기하학적 박스 차이로 재계산
+        if subtract_by == 0.0 {
+            let (gap_top, gap_bottom) = compute_outer_gaps_by_geometry(&window, &container);
+            if gap_top > 0.0 || gap_bottom > 0.0 {
+                console_log!("🔧 가장자리 갭 보정[geometry]: top {:.3}px + bottom {:.3}px = {:.3}px", gap_top, gap_bottom, gap_top + gap_bottom);
+            }
+            subtract_by = gap_top + gap_bottom;
+        }
+
+        // 과도한 보정을 방지: D−C로 클램프
+        let max_subtract = (height_d - height_c).max(0.0);
+        if subtract_by > max_subtract {
+            console_log!("🛡️ 보정값 클램프: {:.3}px → {:.3}px (최대 D−C)", subtract_by, max_subtract);
+            subtract_by = max_subtract;
+        }
+
+        let adjusted_height = (height_d - subtract_by).max(0.0);
+
+        let measured_height = adjusted_height;
+        let page_height = sampling_data.viewport_height as f64;
+
+        // cleanup
+        let _ = body.remove_child(&container);
+        if let Some(head) = document.get_elements_by_tag_name("head").get_with_index(0) {
+            let _ = head.remove_child(&para_style);
+        }
+
+        if page_height > 0.0 {
+            let total_pages = ((measured_height as f64) / page_height).ceil() as i32;
+            PageCalculationResult { total_pages: total_pages.max(1), status: "SUCCESS".to_string() }
+        } else {
+            PageCalculationResult { total_pages: 1, status: "SUCCESS".to_string() }
+        }
+    } else {
+        console_log!("❌ Document body를 찾을 수 없음");
+        PageCalculationResult { total_pages: 1, status: "ERROR".to_string() }
+    }
+}
+
+/// HTML 내용을 분석하여 마진 기여분을 계산
+fn analyze_html_content(document: &Document, sampling_data: &SamplingData) -> i32 {
+    console_log!("📊 === HTML 내용 분석 ===");
+    
+    // 각 요소별 개수 세기
+    let h1_count = count_elements(document, "h1");
+    let h2_count = count_elements(document, "h2");
+    let h3_count = count_elements(document, "h3");
+    let p_count = count_elements(document, "p");
+    let span_count = count_elements(document, "span");
+    let div_count = count_elements(document, "div");
+    
+    console_log!("📝 요소별 개수:");
+    console_log!("  - h1: {}개", h1_count);
+    console_log!("  - h2: {}개", h2_count); 
+    console_log!("  - h3: {}개", h3_count);
+    console_log!("  - p: {}개", p_count);
+    console_log!("  - span: {}개", span_count);
+    console_log!("  - div: {}개", div_count);
+    
+    // 마진 기여분 계산 (샘플링 데이터 기준)
+    let mut total_margin_contribution = 0;
+    
+    // h1 마진 기여
+    if h1_count > 0 {
+        // h1은 보통 큰 마진을 가짐 (h2보다 클 가능성)
+        let h1_margin = get_element_margin_from_styles(&sampling_data.element_styles, "h1", 48); // 기본값 48px
+        let h1_contribution = h1_count * h1_margin;
+        console_log!("  - h1 마진 기여: {}개 × {}px = {}px", h1_count, h1_margin, h1_contribution);
+        total_margin_contribution += h1_contribution;
+    }
+    
+    // h2 마진 기여
+    if h2_count > 0 {
+        let h2_margin = get_element_margin_from_styles(&sampling_data.element_styles, "h2", 38); // 기본값 38px
+        let h2_contribution = h2_count * h2_margin;
+        console_log!("  - h2 마진 기여: {}개 × {}px = {}px", h2_count, h2_margin, h2_contribution);
+        total_margin_contribution += h2_contribution;
+    }
+    
+    // h3 마진 기여
+    if h3_count > 0 {
+        let h3_margin = get_element_margin_from_styles(&sampling_data.element_styles, "h3", 24); // 기본값 24px
+        let h3_contribution = h3_count * h3_margin;
+        console_log!("  - h3 마진 기여: {}개 × {}px = {}px", h3_count, h3_margin, h3_contribution);
+        total_margin_contribution += h3_contribution;
+    }
+    
+    // p 마진 기여
+    if p_count > 0 {
+        let p_margin = get_element_margin_from_styles(&sampling_data.element_styles, "p", 0); // p는 보통 0
+        if p_margin > 0 {
+            let p_contribution = p_count * p_margin;
+            console_log!("  - p 마진 기여: {}개 × {}px = {}px", p_count, p_margin, p_contribution);
+            total_margin_contribution += p_contribution;
+        }
+    }
+    
+    // span 마진 기여
+    if span_count > 0 {
+        let span_margin = get_element_margin_from_styles(&sampling_data.element_styles, "span", 20); // 기본값 20px
+        let span_contribution = span_count * span_margin;
+        console_log!("  - span 마진 기여: {}개 × {}px = {}px", span_count, span_margin, span_contribution);
+        total_margin_contribution += span_contribution;
+    }
+    
+    // div 마진 기여
+    if div_count > 0 {
+        let div_margin = get_element_margin_from_styles(&sampling_data.element_styles, "div", 0); // div는 보통 0
+        if div_margin > 0 {
+            let div_contribution = div_count * div_margin;
+            console_log!("  - div 마진 기여: {}개 × {}px = {}px", div_count, div_margin, div_contribution);
+            total_margin_contribution += div_contribution;
+        }
+    }
+    
+    console_log!("🔢 총 마진 기여분: {}px", total_margin_contribution);
+    
+    // 실제 콘텐츠 분석
+    let total_text_length = get_total_text_length(document);
+    console_log!("📄 총 텍스트 길이: {} chars", total_text_length);
+    
+    // 이미지/미디어 요소 확인
+    let img_count = count_elements(document, "img");
+    let video_count = count_elements(document, "video");
+    let audio_count = count_elements(document, "audio");
+    
+    if img_count > 0 || video_count > 0 || audio_count > 0 {
+        console_log!("🎨 미디어 요소:");
+        console_log!("  - 이미지: {}개", img_count);
+        console_log!("  - 비디오: {}개", video_count);
+        console_log!("  - 오디오: {}개", audio_count);
+    }
+    
+    // 특수 구조 분석
+    analyze_special_structures(document);
+    
+    console_log!("📊 === HTML 분석 완료 ===");
+    
+    total_margin_contribution
+}
+
+/// elementStyles에서 특정 요소의 마진을 추출하는 헬퍼 함수
+fn get_element_margin_from_styles(element_styles: &HashMap<String, HashMap<String, String>>, element_name: &str, default_margin: i32) -> i32 {
+    if let Some(styles) = element_styles.get(element_name) {
+        // 각 방향별 margin 값을 확인하고, 상하 margin만 합산하여 반환
+        let margin_top = styles.get("marginTop")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        let margin_bottom = styles.get("marginBottom")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        
+        let total_margin = margin_top + margin_bottom;
+        if total_margin > 0 {
+            return total_margin;
+        }
+        
+        // 기존 방식(margin 필드)도 fallback으로 유지
+        if let Some(margin_str) = styles.get("margin") {
+            if let Ok(margin_value) = margin_str.parse::<i32>() {
+                return margin_value;
+            }
+        }
+    }
+    default_margin
+}
+
+/// 특정 태그의 요소 개수를 세는 함수
+fn count_elements(document: &Document, tag_name: &str) -> i32 {
+    let elements = document.get_elements_by_tag_name(tag_name);
+    elements.length() as i32
+}
+
+/// 전체 텍스트 길이 계산
+fn get_total_text_length(document: &Document) -> usize {
+    if let Some(body) = document.body() {
+        let text_content = body.text_content().unwrap_or_default();
+        // HTML 태그 제거하고 실제 텍스트만 계산
+        text_content.chars().filter(|c| !c.is_whitespace() || *c == ' ').collect::<String>().len()
+    } else {
+        0
+    }
+}
+
+/// 특수 구조 분석 (리스트, 테이블 등)
+fn analyze_special_structures(document: &Document) {
+    let list_items = count_elements(document, "li");
+    let tables = count_elements(document, "table");
+    let blockquotes = count_elements(document, "blockquote");
+    let code_blocks = count_elements(document, "pre");
+    
+    if list_items > 0 || tables > 0 || blockquotes > 0 || code_blocks > 0 {
+        console_log!("🏗️ 특수 구조:");
+        if list_items > 0 { console_log!("  - 리스트 아이템: {}개", list_items); }
+        if tables > 0 { console_log!("  - 테이블: {}개", tables); }
+        if blockquotes > 0 { console_log!("  - 인용구: {}개", blockquotes); }
+        if code_blocks > 0 { console_log!("  - 코드 블록: {}개", code_blocks); }
+    }
+    
+    // 네스팅 깊이 분석
+    analyze_nesting_depth(document);
+}
+
+/// HTML 네스팅 깊이 분석
+fn analyze_nesting_depth(document: &Document) {
+    if let Some(body) = document.body() {
+        let max_depth = calculate_max_depth(&body, 0);
+        console_log!("📏 최대 네스팅 깊이: {} 레벨", max_depth);
+        
+        if max_depth > 10 {
+            console_log!("⚠️ 복잡한 HTML 구조 감지 - 렌더링에 영향 가능");
+        }
+    }
+}
+
+/// 요소의 최대 네스팅 깊이 계산
+fn calculate_max_depth(element: &Element, current_depth: i32) -> i32 {
+    let children = element.children();
+    let mut max_child_depth = current_depth;
+    
+    for i in 0..children.length() {
+        if let Some(child) = children.get_with_index(i) {
+            let child_depth = calculate_max_depth(&child, current_depth + 1);
+            if child_depth > max_child_depth {
+                max_child_depth = child_depth;
+            }
+        }
+    }
+    
+    max_child_depth
 }
 
 /// 테스트용 헬퍼 함수들
@@ -247,14 +1160,33 @@ mod tests {
                 line_height: 24.0,
                 character_width: 8.0,
             },
-            layout_metrics: LayoutMetrics {
+            css_variables: CssVariables {
+                vars: HashMap::from([
+                    ("--RS__baseLineHeight".to_string(), "calc((1em + (2ex - 1ch) - ((1rem - 16px) * 0.1667)) * 1)".to_string()),
+                ]),
+            },
+            element_styles: HashMap::from([
+                ("h2".to_string(), HashMap::from([
+                    ("margin-top".to_string(), "19.92px".to_string()),
+                    ("margin-bottom".to_string(), "19.92px".to_string()),
+                ])),
+                ("span".to_string(), HashMap::from([
+                    ("margin-bottom".to_string(), "20px".to_string()),
+                ])),
+            ]),
+            body_style: Some(BodyStyle {
                 content_width: 780,
                 content_height: 580,
                 margin_top: 10,
+                margin_right: 10,
                 margin_bottom: 10,
                 margin_left: 10,
-                margin_right: 10,
-            },
+                padding_top: 20,
+                padding_right: 20,
+                padding_bottom: 10,
+                padding_left: 10,
+            }),
+            root_style_attr: None,
         };
 
         let json = serde_json::to_string(&sampling_data).unwrap();
@@ -262,6 +1194,10 @@ mod tests {
         
         assert_eq!(sampling_data.viewport_width, deserialized.viewport_width);
         assert_eq!(sampling_data.font_metrics.font_size, deserialized.font_metrics.font_size);
+        assert!(deserialized.body_style.is_some());
+        let body_style = deserialized.body_style.unwrap();
+        assert_eq!(body_style.content_width, 780);
+        assert_eq!(body_style.margin_top, 10);
     }
 
     #[test]

@@ -141,37 +141,26 @@ public class EpubNavigatorFragment internal constructor(
     }
 
     // WASM-based page calculation
-    private val wasmPageCalculator: WasmPageCalculator by lazy {
-        DefaultWasmPageCalculator(requireContext())
+    private val pageCalculationManager: EpubPageCalculationManager by lazy {
+        EpubPageCalculationManager(requireContext(), publication, this.readingOrder)
     }
-    private val _totalPagesFlow = MutableStateFlow<Int?>(null)
 
     /**
      * Flow of total pages count for the entire publication.
      * Null indicates the count is still being calculated.
      */
-    public val totalPages: StateFlow<Int?> = _totalPagesFlow
+    public val totalPages: StateFlow<Int?> get() = pageCalculationManager.totalPages
 
     /**
      * Get current reading progress as percentage (0.0 to 1.0).
      * Returns null if total pages not yet calculated.
      */
     public fun getCurrentReadingProgress(): Double? {
-        val total = _totalPagesFlow.value ?: return null
-        if (total <= 0) return 0.0
-
-        val currentFragment = currentReflowablePageFragment
-        val currentPageInResource = currentFragment?.webView?.mCurItem ?: 0
-
-        // Calculate pages before current resource
-        var pagesBefore = 0
-        for (i in 0 until currentPagerPosition) {
-            val fragment = fragmentAt(i) as? R2EpubPageFragment
-            pagesBefore += fragment?.webView?.numPages ?: 1
-        }
-
-        val currentAbsolutePage = pagesBefore + currentPageInResource + 1
-        return (currentAbsolutePage.toDouble() / total).coerceIn(0.0, 1.0)
+        return pageCalculationManager.getCurrentReadingProgress(
+            currentPagerPosition = currentPagerPosition,
+            getCurrentFragment = { currentReflowablePageFragment },
+            getFragmentAt = { index -> fragmentAt(index) as? R2EpubPageFragment }
+        )
     }
 
     public data class Configuration internal constructor(
@@ -651,282 +640,15 @@ public class EpubNavigatorFragment internal constructor(
             }
         }
 
-        // Initialize WASM calculator and start page calculation
-        Log.e("EpubPageCalc", "🔥 onViewCreated에서 페이지 계산 시작!")
+        // Start total pages calculation using pageCalculationManager
         viewLifecycleOwner.lifecycleScope.launch {
-            Log.e("EpubPageCalc", "🔥 wasmPageCalculator.initialize() 호출 중...")
-            if (wasmPageCalculator.initialize()) {
-                Log.e("EpubPageCalc", "🔥 초기화 성공! WASM 테스트 실행...")
-
-                // WASM 연결 테스트
-                val testResult = wasmPageCalculator.testWasmConnection()
-                Log.e("EpubPageCalc", "🧪 WASM 테스트 결과: $testResult")
-
-                Log.e("EpubPageCalc", "🔥 calculateTotalPages() 호출...")
-                calculateTotalPages()
-            } else {
-                Log.e("EpubPageCalc", "❌ WASM 초기화 실패!")
-            }
-        }
-    }
-
-    /**
-     * Initialize WASM page calculator and start total page count calculation.
-     */
-    private fun initializePageCalculation() {
-        Log.e("EpubPageCalc", "🔥 initializePageCalculation() 호출됨!")
-        viewLifecycleOwner.lifecycleScope.launch {
-            Log.e("EpubPageCalc", "🔥 wasmPageCalculator.initialize() 호출 중...")
-            if (wasmPageCalculator.initialize()) {
-                Log.e("EpubPageCalc", "🔥 초기화 성공! calculateTotalPages() 호출...")
-                calculateTotalPages()
-            } else {
-                Log.e("EpubPageCalc", "❌ WASM 초기화 실패!")
-            }
-        }
-    }
-
-    /**
-     * Calculate total pages using sampling-based approach with WASM.
-     */
-    private suspend fun calculateTotalPages() {
-        Log.e("EpubPageCalc", "🔥 calculateTotalPages() 호출됨!")
-        Log.d("EpubPageCalc", "[전체] 전체 EPUB 페이지 계산 시작")
-
-        // Wait for ViewPager and fragments to be created
-        var currentFragment: R2EpubPageFragment? = null
-        var attempts = 0
-        while (currentFragment == null && attempts < 20) {
-            delay(500) // Wait 500ms
-
-            // Debug ViewPager state
-            val pagerAdapter = r2PagerAdapter
-            val hasResourcePager = ::resourcePager.isInitialized
-            val adapterItemCount = pagerAdapter?.itemCount ?: -1
-            var fragmentsCount = pagerAdapter?.mFragments?.size
-            val currentItem = if (hasResourcePager) resourcePager.currentItem else -1
-
-            Log.e("EpubPageCalc", "🔥 시도 ${attempts + 1}:")
-            Log.e("EpubPageCalc", "  - resourcePager 초기화됨: $hasResourcePager")
-            Log.e("EpubPageCalc", "  - r2PagerAdapter: $pagerAdapter")
-            Log.e("EpubPageCalc", "  - adapter.itemCount: $adapterItemCount")
-            Log.e("EpubPageCalc", "  - fragments 개수: $fragmentsCount")
-            Log.e("EpubPageCalc", "  - currentItem: $currentItem")
-
-            if (hasResourcePager && pagerAdapter != null && currentItem >= 0) {
-                val itemId = pagerAdapter.getItemId(currentItem)
-                Log.e("EpubPageCalc", "  - itemId($currentItem): $itemId")
-
-                pagerAdapter.mFragments.forEach { key, fragment ->
-                    Log.e("EpubPageCalc", "  - fragment[$key]: $fragment")
-                }
-
-                currentFragment = pagerAdapter.mFragments[itemId] as? R2EpubPageFragment
-            }
-
-            Log.e("EpubPageCalc", "  - 결과 fragment: $currentFragment")
-            attempts++
-        }
-
-        if (currentFragment == null) {
-            Log.e("EpubPageCalc", "❌ 현재 fragment를 찾을 수 없음, WebView fallback 사용")
-            calculateTotalPagesWebViewFallback()
-            return
-        }
-
-        Log.e("EpubPageCalc", "✅ 현재 fragment 찾음: $currentFragment")
-
-        // Wait until the fragment is loaded
-        Log.e("EpubPageCalc", "🔥 fragment.isLoaded 체크 중...")
-        currentFragment.isLoaded.collect { isLoaded ->
-            Log.e("EpubPageCalc", "🔥 fragment.isLoaded = $isLoaded")
-            if (isLoaded) {
-                Log.d("EpubPageCalc", "[전체] 현재 리소스의 샘플링 데이터 수집 완료, 각 리소스별 페이지 계산 시작")
-                performSamplingBasedCalculation(currentFragment)
-            }
-        }
-    }
-
-    /**
-     * Perform sampling-based page calculation using first loaded resource.
-     */
-    private suspend fun performSamplingBasedCalculation(samplingFragment: R2EpubPageFragment) {
-        try {
-            Log.d("EpubPageCalc", "[전체] 샘플링 데이터 수집 중...")
-            // Collect sampling data from the first loaded WebView
-            val samplingData = collectSamplingData(samplingFragment)
-            Log.d("EpubPageCalc", "[전체] 샘플링 데이터: $samplingData")
-
-            var totalPageCount = 0
-
-            // Process each resource in reading order
-            for (link in readingOrder) {
-                val resource = publication.get(link)
-                Log.d("EpubPageCalc", "[전체] 리소스 페이지 계산: ${link.href}")
-                if (resource != null) {
-                    val htmlResult = resource.read()
-                    htmlResult.getOrNull()?.let { bytes ->
-                        val html = String(bytes)
-                        val result = wasmPageCalculator.calculatePages(html, samplingData)
-                        Log.d(
-                            "EpubPageCalc",
-                            "[전체] 리소스 결과 status=${result.status} totalPages=${result.totalPages}"
-                        )
-
-                        when (result.status) {
-                            WasmCalculationResult.Status.SUCCESS -> {
-                                Log.d(
-                                    "EpubPageCalc",
-                                    "[전체] WASM 정상 계산, 페이지 수: ${result.totalPages}"
-                                )
-                                totalPageCount += result.totalPages
-                            }
-
-                            WasmCalculationResult.Status.FALLBACK_NEEDED -> {
-                                // Use WebView-based calculation as fallback
-                                val count = getWebViewPageCount(link)
-                                Log.d(
-                                    "EpubPageCalc",
-                                    "[전체] WASM Fallback 필요, WebView 기반 계산 페이지 수: $count"
-                                )
-                                totalPageCount += count
-                            }
-
-                            WasmCalculationResult.Status.ERROR -> {
-                                val est = estimatePagesByContentSize(html, samplingData)
-                                Log.d("EpubPageCalc", "[전체] WASM 계산 오류, 컨텐츠 길이 기반 추정 페이지 수: $est")
-                                totalPageCount += est
-                            }
-                        }
-                    }
-                }
-            }
-
-            Log.d("EpubPageCalc", "[전체] 전체 계산 완료, totalPageCount=$totalPageCount")
-            _totalPagesFlow.value = totalPageCount
-
-        } catch (e: Exception) {
-            Log.e("EpubPageCalc", "[전체] 예외 발생, WebView 기반 전체 페이지 계산으로 대체", e)
-            // Fallback to traditional WebView-based calculation
-            calculateTotalPagesWebViewFallback()
-        }
-    }
-
-    /**
-     * Collect sampling data from a loaded WebView fragment.
-     */
-    private suspend fun collectSamplingData(fragment: R2EpubPageFragment): SamplingData {
-        val webView = fragment.webView ?: throw IllegalStateException("WebView not available")
-
-        // Collect metrics via JavaScript
-        val metricsJson = webView.runJavaScriptSuspend(
-            """
-            (function() {
-                const style = window.getComputedStyle(document.body);
-                const testSpan = document.createElement('span');
-                const testText = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
-                testSpan.textContent = testText;
-                testSpan.style.visibility = 'hidden';
-                document.body.appendChild(testSpan);
-                const rect = testSpan.getBoundingClientRect();
-                document.body.removeChild(testSpan);
-                
-                return JSON.stringify({
-                    viewportWidth: window.innerWidth,
-                    viewportHeight: window.innerHeight,
-                    fontSize: parseFloat(style.fontSize),
-                    lineHeight: parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2,
-                    characterWidth: rect.width / testText.length,
-                    contentWidth: document.body.scrollWidth,
-                    contentHeight: document.body.scrollHeight,
-                    marginTop: parseFloat(style.marginTop) || 0,
-                    marginBottom: parseFloat(style.marginBottom) || 0,
-                    marginLeft: parseFloat(style.marginLeft) || 0,
-                    marginRight: parseFloat(style.marginRight) || 0
-                });
-            })();
-            """
-        )
-
-        Log.d("EpubPageCalc", "[샘플링] JavaScript 결과: $metricsJson")
-
-        // JavaScript가 JSON.stringify()로 이미 문자열로 반환한 결과를 다시 문자열로 감쌌으므로 따옴표 제거
-        val cleanedJson = metricsJson.trim().removeSurrounding("\"").replace("\\\"", "\"")
-        Log.d("EpubPageCalc", "[샘플링] 정리된 JSON: $cleanedJson")
-
-        val metrics = JSONObject(cleanedJson)
-
-        return SamplingData(
-            viewportWidth = metrics.optInt("viewportWidth", 800),
-            viewportHeight = metrics.optInt("viewportHeight", 600),
-            fontMetrics = FontMetrics(
-                fontSize = metrics.optDouble("fontSize", 16.0).toFloat(),
-                lineHeight = metrics.optDouble("lineHeight", 19.2).toFloat(),
-                characterWidth = metrics.optDouble("characterWidth", 8.0).toFloat()
-            ),
-            layoutMetrics = LayoutMetrics(
-                contentWidth = metrics.optInt("contentWidth", 800),
-                contentHeight = metrics.optInt("contentHeight", 600),
-                marginTop = metrics.optInt("marginTop", 0),
-                marginBottom = metrics.optInt("marginBottom", 0),
-                marginLeft = metrics.optInt("marginLeft", 0),
-                marginRight = metrics.optInt("marginRight", 0)
+            pageCalculationManager.startCalculation(
+                getCurrentReflowablePageFragment = { currentReflowablePageFragment },
+                getFragmentAt = { index -> fragmentAt(index) as? R2EpubPageFragment }
             )
-        )
-    }
-
-    /**
-     * Get page count for a specific resource using WebView (fallback method).
-     */
-    private fun getWebViewPageCount(link: Link): Int {
-        val fragment = loadedFragmentForHref(link.url())
-        val pages = fragment?.webView?.numPages ?: 1
-        Log.d("EpubPageCalc", "[WebView] ${link.href} -> $pages 페이지 (WebView 기반)")
-        return pages
-    }
-
-    /**
-     * Estimate pages by content size when WASM calculation fails.
-     */
-    private fun estimatePagesByContentSize(html: String, samplingData: SamplingData): Int {
-        val textContent = html.replace(Regex("<[^>]+>"), "")
-        val contentLength = textContent.length
-
-        val charsPerLine =
-            (samplingData.layoutMetrics.contentWidth / samplingData.fontMetrics.characterWidth).toInt()
-        val linesPerPage =
-            (samplingData.layoutMetrics.contentHeight / samplingData.fontMetrics.lineHeight).toInt()
-        val charsPerPage = charsPerLine * linesPerPage
-
-        val estimatedPages = if (charsPerPage > 0) {
-            kotlin.math.max(1, (contentLength / charsPerPage))
-        } else {
-            1
         }
-
-        Log.d(
-            "EpubPageCalc",
-            "[추정] 텍스트 길이: $contentLength, 페이지당 글자 수: $charsPerPage -> $estimatedPages 페이지"
-        )
-        return estimatedPages
     }
 
-    /**
-     * Fallback to traditional WebView-based total page calculation.
-     */
-    private suspend fun calculateTotalPagesWebViewFallback() {
-        Log.d("EpubPageCalc", "[폴백] WebView 기반 전체 페이지 계산 시작")
-        // Traditional approach - sum up all WebView page counts
-        var totalPages = 0
-        for (i in readingOrder.indices) {
-            val fragment = fragmentAt(i) as? R2EpubPageFragment
-            val pages = fragment?.webView?.numPages ?: 1
-            Log.d("EpubPageCalc", "[폴백] 리소스 인덱스 $i -> $pages 페이지")
-            totalPages += pages
-        }
-        Log.d("EpubPageCalc", "[폴백] WebView 기반 총 페이지: $totalPages")
-        _totalPagesFlow.value = totalPages
-    }
 
     private fun handleEvent(event: EpubNavigatorViewModel.Event) {
         when (event) {
@@ -1534,8 +1256,8 @@ public class EpubNavigatorFragment internal constructor(
     }
 
     override fun onDestroyView() {
-        // WASM 모듈 리소스 정리
-        wasmPageCalculator.destroy()
+        // Clean up WASM/page calculation manager resources
+        pageCalculationManager.destroy()
 
         super.onDestroyView()
     }
