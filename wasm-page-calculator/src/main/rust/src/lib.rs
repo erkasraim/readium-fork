@@ -100,43 +100,8 @@ fn compute_outer_gaps_by_geometry(window: &Window, container: &Element) -> (f64,
     (top_gap, bottom_gap)
 }
 
-// Custom deserializer for string to i32
-fn string_to_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrInt {
-        String(String),
-        Int(i32),
-    }
-
-    match StringOrInt::deserialize(deserializer)? {
-        StringOrInt::String(s) => s.parse().map_err(serde::de::Error::custom),
-        StringOrInt::Int(i) => Ok(i),
-    }
-}
-
-// Custom deserializer for string to f32 (flexible - handles string, float, or int)
-fn flexible_f32<'de, D>(deserializer: D) -> Result<f32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum FlexibleNumber {
-        String(String),
-        Float(f32),
-        Int(i32),
-    }
-
-    match FlexibleNumber::deserialize(deserializer)? {
-        FlexibleNumber::String(s) => s.parse().map_err(serde::de::Error::custom),
-        FlexibleNumber::Float(f) => Ok(f),
-        FlexibleNumber::Int(i) => Ok(i as f32),
-    }
-}
+// (removed) string_to_i32: unused
+// (removed) flexible_f32: only used by removed FontMetrics
 
 // Optional string to i32 (handles both string and int inputs)
 fn opt_string_to_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
@@ -339,6 +304,59 @@ fn debug_log_root_body(window: &Window, document: &Document) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RootPrevAttrs {
+    prev_style: Option<String>,
+    prev_lang: Option<String>,
+    prev_dir: Option<String>,
+    prev_writing_mode: Option<String>,
+}
+
+/// :root에 style/lang/dir/data-writing-mode를 적용하고 이전 값을 반환 (로그 포함)
+fn apply_root_context_and_log(
+    window: &Window,
+    document: &Document,
+    sampling_data: &SamplingData,
+    effective_lang: &str,
+) -> RootPrevAttrs {
+    let mut prev = RootPrevAttrs {
+        prev_style: None,
+        prev_lang: None,
+        prev_dir: None,
+        prev_writing_mode: None,
+    };
+    if let Some(root) = document.document_element() {
+        prev.prev_style = root.get_attribute("style");
+        prev.prev_lang = root.get_attribute("lang");
+        prev.prev_dir = root.get_attribute("dir");
+        prev.prev_writing_mode = root.get_attribute("data-writing-mode");
+
+        if let Some(style_attr) = &sampling_data.root_style_attr {
+            let _ = root.set_attribute("style", style_attr);
+            console_log!("🧭 :root style 복제 적용: {}", style_attr);
+        }
+        if !effective_lang.is_empty() { let _ = root.set_attribute("lang", effective_lang); }
+        if let Some(dir) = sampling_data.document_dir.as_ref() { if !dir.is_empty() { let _ = root.set_attribute("dir", dir); } }
+        if let Some(wm) = sampling_data.document_writing_mode.as_ref() { if !wm.is_empty() { let _ = root.set_attribute("data-writing-mode", wm); } }
+
+        // 로깅
+        let applied_root_lang = root.get_attribute("lang").unwrap_or_default();
+        let applied_root_dir = root.get_attribute("dir").unwrap_or_default();
+        let applied_root_wm = root.get_attribute("data-writing-mode").unwrap_or_default();
+        let root_wm_computed = window
+            .get_computed_style(&root)
+            .ok()
+            .flatten()
+            .map(|cs| cs.get_property_value("writing-mode").unwrap_or_default())
+            .unwrap_or_default();
+        console_log!(
+            "🧾 [:root attrs] lang='{}', dir='{}', data-writing-mode='{}' | computed writing-mode='{}'",
+            applied_root_lang, applied_root_dir, applied_root_wm, root_wm_computed
+        );
+    }
+    prev
+}
+
 //// Paged 모드에서 :root에 멀티컬럼과 100vh 높이를 강제 적용
 fn inject_paged_root_css(sheet_el: &HtmlElement, viewport_height: i32) {
     let scoped = format!(
@@ -418,12 +436,8 @@ pub struct SamplingData {
     pub viewport_width: i32,
     #[serde(rename = "viewportHeight")]
     pub viewport_height: i32,
-    #[serde(rename = "fontMetrics")]
-    pub font_metrics: FontMetrics,
     #[serde(rename = "cssVariables")]
     pub css_variables: CssVariables,
-    #[serde(rename = "elementStyles")]
-    pub element_styles: HashMap<String, HashMap<String, String>>,
     #[serde(rename = "bodyStyle")]
     pub body_style: Option<BodyStyle>,
     #[serde(rename = "rootStyleAttr")]
@@ -436,18 +450,7 @@ pub struct SamplingData {
     pub document_writing_mode: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FontMetrics {
-    #[serde(rename = "fontSize")]
-    #[serde(deserialize_with = "flexible_f32")]
-    pub font_size: f32,
-    #[serde(rename = "lineHeight")]
-    #[serde(deserialize_with = "flexible_f32")]
-    pub line_height: f32,
-    #[serde(rename = "characterWidth")]
-    #[serde(deserialize_with = "flexible_f32")]
-    pub character_width: f32,
-}
+// (removed) FontMetrics: no longer needed
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CssVariables {
@@ -526,12 +529,8 @@ pub fn calculate_pages_with_css(html: &str, css_text: &str, sampling_data_json: 
         }
     };
 
-    // 페이지 계산 실행 (외부 CSS 유무에 따라 분기)
-    let result = if css_text.is_empty() {
-        calculate_pages_internal(html, &sampling_data)
-    } else {
-        calculate_pages_internal_with_css(html, css_text, &sampling_data)
-    };
+    // 페이지 계산 실행: 항상 with-CSS 경로 사용
+    let result = calculate_pages_internal_with_css(html, css_text, &sampling_data);
     
     console_log!("✅ 계산 완료: {} pages", result.total_pages);
 
@@ -618,27 +617,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             }
         }
     }
-    // 언어/방향/쓰기모드(데이터 속성) 복제 및 로깅
-    if !effective_lang.is_empty() { let _ = html_element.set_attribute("lang", &effective_lang); }
-    if let Some(dir) = sampling_data.document_dir.as_ref() {
-        if !dir.is_empty() { let _ = html_element.set_attribute("dir", dir); }
-    }
-    if let Some(wm) = sampling_data.document_writing_mode.as_ref() {
-        if !wm.is_empty() { let _ = html_element.set_attribute("data-writing-mode", wm); }
-    }
-    let applied_lang = html_element.get_attribute("lang").unwrap_or_default();
-    let applied_dir = html_element.get_attribute("dir").unwrap_or_default();
-    let applied_wm_attr = html_element.get_attribute("data-writing-mode").unwrap_or_default();
-    let wm_computed = window
-        .get_computed_style(&container)
-        .ok()
-        .flatten()
-        .map(|cs| cs.get_property_value("writing-mode").unwrap_or_default())
-        .unwrap_or_default();
-    console_log!(
-        "🧾 [container attrs] lang='{}', dir='{}', data-writing-mode='{}' | computed writing-mode='{}'",
-        applied_lang, applied_dir, applied_wm_attr, wm_computed
-    );
+    // 컨테이너에는 lang/dir/data-writing-mode를 설정하지 않음 (:root만 적용)
     
     // wrapper 스타일 핸들
     let wrapper_html = wrapper.dyn_ref::<HtmlElement>().unwrap();
@@ -753,38 +732,9 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
     if let Some(body) = document.body() {
         // :root style 토글 복제는 반드시 측정 전에 적용되어야 함
         let root_el = document.document_element();
-        let mut prev_root_style: Option<String> = None;
-        let mut prev_root_lang: Option<String> = None;
-        let mut prev_root_dir: Option<String> = None;
-        let mut prev_root_wm_attr: Option<String> = None;
-        if let Some(root) = &root_el {
-            prev_root_style = root.get_attribute("style");
-            prev_root_lang = root.get_attribute("lang");
-            prev_root_dir = root.get_attribute("dir");
-            prev_root_wm_attr = root.get_attribute("data-writing-mode");
-            if let Some(style_attr) = &sampling_data.root_style_attr {
-                let _ = root.set_attribute("style", style_attr);
-                console_log!("🧭 :root style 복제 적용: {}", style_attr);
-            }
-            // :root에 언어/방향/쓰기모드 데이터 속성도 반영 (언어 기반 var 적용 보장)
-            if !effective_lang.is_empty() { let _ = root.set_attribute("lang", &effective_lang); }
-            if let Some(dir) = sampling_data.document_dir.as_ref() { if !dir.is_empty() { let _ = root.set_attribute("dir", dir); } }
-            if let Some(wm) = sampling_data.document_writing_mode.as_ref() { if !wm.is_empty() { let _ = root.set_attribute("data-writing-mode", wm); } }
-            // 로깅: :root에 실제로 적용된 값과 computed writing-mode
-            let applied_root_lang = root.get_attribute("lang").unwrap_or_default();
-            let applied_root_dir = root.get_attribute("dir").unwrap_or_default();
-            let applied_root_wm = root.get_attribute("data-writing-mode").unwrap_or_default();
-            let root_wm_computed = window
-                .get_computed_style(root)
-                .ok()
-                .flatten()
-                .map(|cs| cs.get_property_value("writing-mode").unwrap_or_default())
-                .unwrap_or_default();
-            console_log!(
-                "🧾 [:root attrs] lang='{}', dir='{}', data-writing-mode='{}' | computed writing-mode='{}'",
-                applied_root_lang, applied_root_dir, applied_root_wm, root_wm_computed
-            );
-        }
+        // :root 컨텍스트 적용 및 이전값 저장
+        let prev_root = apply_root_context_and_log(&window, &document, &sampling_data, &effective_lang);
+        
         if let Err(_) = wrapper.append_child(&container) {
             console_log!("❌ 래퍼에 컨테이너 추가 실패");
             return PageCalculationResult {
@@ -807,23 +757,6 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
         let height_a = rect_a.height();
         console_log!("📏 A 베이스라인 높이: {:.3}px, width: {:.3}px", height_a, width_a);
 
-        // B) width/box-sizing만 적용 → 래퍼가 담당하므로 래퍼 스타일만 유지
-        // (이미 wrapper_style에 적용되어 있음)
-        let rect_b = html_element.get_bounding_client_rect();
-        let width_b = rect_b.width();
-        let height_b = rect_b.height();
-        console_log!("📏 B width/box 적용 후: {:.3}px (ΔA→B: {:.3}px), width: {:.3}px", height_b, height_b - height_a, width_b);
-
-        // C) 타이포그래피 인라인 적용은 생략 (외부 CSS 사용)
-        let rect_c = html_element.get_bounding_client_rect();
-        let height_c = rect_c.height();
-        console_log!("📏 C 타이포 적용 생략: {:.3}px (ΔB→C: {:.3}px, 누적 ΔA→C: {:.3}px)", height_c, height_c - height_b, height_c - height_a);
-
-
-        // CSS 변수 적용
-        for (key, value) in &sampling_data.css_variables.vars {
-            //let _ = style.set_property(key, value);
-        }
         // :root에도 동일 변수 적용 (전역 규칙의 var() 해석용)
         apply_css_variables_to_root(&document, &sampling_data.css_variables.vars);
         
@@ -879,26 +812,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
         let rect_d = html_element.get_bounding_client_rect();
         let width_d = rect_d.width();
         let height_d = rect_d.height();
-        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px), width: {:.3}px", height_d, height_d - height_c, height_d - height_a, width_d);
-
-        // 추가 디버그: container와 첫 요소의 column-gap, break-* 확인
-        if let Ok(Some(cs_cont)) = window.get_computed_style(&container) {
-            let gap = cs_cont.get_property_value("column-gap").unwrap_or_default();
-            let gap_px = parse_css_px(&gap);
-            let bi = cs_cont.get_property_value("break-inside").unwrap_or_default();
-            let ba = cs_cont.get_property_value("break-after").unwrap_or_default();
-            console_log!("🔎 [container] column-gap={} ({:.3}px), break-inside={}, break-after={}", gap, gap_px, bi, ba);
-        }
-        if let Ok(Some(first)) = container.query_selector("h1, h2, h3, figure, tr, hr, table, img") {
-            if let Some(first_el) = first.dyn_ref::<Element>() {
-                if let Ok(Some(cs)) = window.get_computed_style(first_el) {
-                    let tag = first_el.tag_name();
-                    let bi = cs.get_property_value("break-inside").unwrap_or_default();
-                    let ba = cs.get_property_value("break-after").unwrap_or_default();
-                    console_log!("🔎 [first:{}] break-inside={}, break-after={}", tag, bi, ba);
-                }
-            }
-        }
+        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px, 누적 ΔA→D: {:.3}px, width: {:.3}px", height_d, height_d - height_a, width_d);
 
         let mut measured_height = html_element.scroll_height() as f64;
         let mut measured_max = measured_height;
@@ -943,10 +857,11 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             let _ = head.remove_child(&para_style);
         }
         // :root attr 원복
-        if let Some(root) = &root_el {
-            match prev_root_lang { Some(v) => { let _ = root.set_attribute("lang", &v); }, None => { let _ = root.remove_attribute("lang"); } }
-            match prev_root_dir { Some(v) => { let _ = root.set_attribute("dir", &v); }, None => { let _ = root.remove_attribute("dir"); } }
-            match prev_root_wm_attr { Some(v) => { let _ = root.set_attribute("data-writing-mode", &v); }, None => { let _ = root.remove_attribute("data-writing-mode"); } }
+        if let Some(root) = document.document_element() {
+            match prev_root.prev_lang { Some(v) => { let _ = root.set_attribute("lang", &v); }, None => { let _ = root.remove_attribute("lang"); } }
+            match prev_root.prev_dir { Some(v) => { let _ = root.set_attribute("dir", &v); }, None => { let _ = root.remove_attribute("dir"); } }
+            match prev_root.prev_writing_mode { Some(v) => { let _ = root.set_attribute("data-writing-mode", &v); }, None => { let _ = root.remove_attribute("data-writing-mode"); } }
+            // style은 호출 측에서 토글 전달 가능성이 있어 원복은 보류; data-wasm-paged는 제거
             let _ = root.remove_attribute("data-wasm-paged");
         }
 
@@ -969,272 +884,10 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
     }
 }
 
-/// 외부 CSS가 없는 경우(샘플링 기반 fallback)의 페이지 계산 로직
-fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCalculationResult {
-    console_log!("🧮 (fallback) 페이지 계산 시작 - 외부 CSS 없음");
-
-    let window = match window() {
-        Some(w) => w,
-        None => {
-            console_log!("❌ Window 객체를 찾을 수 없음");
-            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
-        }
-    };
-
-    let document = match window.document() {
-        Some(d) => d,
-        None => {
-            console_log!("❌ Document 객체를 찾을 수 없음");
-            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
-        }
-    };
-
-    // 컨테이너 준비
-    let container = match document.create_element("div") {
-        Ok(elem) => elem,
-        Err(_) => {
-            console_log!("❌ 컨테이너 엘리먼트 생성 실패");
-            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
-        }
-    };
-    container.set_inner_html(html);
-
-    let html_element = container.dyn_ref::<HtmlElement>().unwrap();
-    let style = html_element.style();
-    html_element.set_attribute("data-wasm-container", "true").unwrap_or_default();
-
-    let _ = style.set_property("display", "block");
-    let _ = style.set_property("box-sizing", "border-box");
-    let _ = style.set_property("width", "100%");
-
-    // 너비 계산 (샘플링된 body 스타일 기준)
-    let mut pure_content_width = sampling_data.viewport_width;
-    if let Some(body_style) = &sampling_data.body_style {
-        let total_horizontal_padding = body_style.padding_left + body_style.padding_right;
-        let total_width_including_padding = body_style.content_width;
-        pure_content_width = if total_horizontal_padding > 0 {
-            total_width_including_padding - total_horizontal_padding
-        } else {
-            total_width_including_padding
-        };
-        console_log!("📐 (fallback) 순수 콘텐츠 너비: {}px", pure_content_width);
-    }
-
-    // 샘플링 데이터 기반 폰트 패밀리
-    let actual_font_family = if let Some(body_styles) = sampling_data.element_styles.get("body") {
-        if let Some(font_family) = body_styles.get("fontFamily") {
-            font_family.clone()
-        } else {
-            "\"Iowan Old Style\",\"Sitka Text\",Palatino,\"Book Antiqua\",serif".to_string()
-        }
-    } else {
-        "\"Iowan Old Style\",\"Sitka Text\",Palatino,\"Book Antiqua\",serif".to_string()
-    };
-    console_log!("🎨 (fallback) 폰트 패밀리 적용: {}", actual_font_family);
-
-    // 스타일 요소 생성: elementStyles 전부를 스코프에 맞춰 주입
-    let para_style = document.create_element("style").unwrap();
-    let mut css_rules = String::new();
-
-    for (tag_name, styles) in &sampling_data.element_styles {
-        let font_family = styles.get("fontFamily").unwrap_or(&actual_font_family).clone();
-        let font_size = styles.get("fontSize")
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(sampling_data.font_metrics.font_size);
-        let line_height = styles.get("lineHeight")
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(sampling_data.font_metrics.line_height);
-        let font_weight = styles.get("fontWeight").map_or("400", |v| v).clone();
-        
-        let margin_top = styles.get("marginTop").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let margin_bottom = styles.get("marginBottom").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let margin_left = styles.get("marginLeft").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let margin_right = styles.get("marginRight").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-
-        let padding_top = styles.get("paddingTop").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let padding_bottom = styles.get("paddingBottom").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let padding_left = styles.get("paddingLeft").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let padding_right = styles.get("paddingRight").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-
-        let text_indent = styles.get("textIndent").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let letter_spacing = styles.get("letterSpacing").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-        let word_spacing = styles.get("wordSpacing").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
-
-        let text_align = styles.get("textAlign").map_or("left", |v| v);
-        let display = styles.get("display").map_or("block", |v| v);
-        let white_space = styles.get("whiteSpace").map_or("normal", |v| v);
-
-        let tag_css = format!(
-            r#"div[data-wasm-container] {} {{
-                    margin: {}px {}px {}px {}px;
-                    padding: {}px {}px {}px {}px;
-                    font-size: {}px;
-                    line-height: var(--RS__baseLineHeight, {}px);
-                    font-family: {};
-                    font-weight: {};
-                    text-align: {};
-                    text-indent: {}px;
-                    letter-spacing: {}px;
-                    word-spacing: {}px;
-                    display: {};
-                    white-space: {};
-                }}
-                "#,
-            tag_name,
-            margin_top, margin_right, margin_bottom, margin_left,
-            padding_top, padding_right, padding_bottom, padding_left,
-            font_size, line_height, font_family, font_weight,
-            text_align, text_indent, letter_spacing, word_spacing,
-            display, white_space
-        );
-        css_rules.push_str(&tag_css);
-    }
-
-    // container padding/margin도 fallback으로 적용
-    if let Some(body_style) = &sampling_data.body_style {
-        let container_css = format!(
-            r#"
-                div[data-wasm-container] {{
-                    padding: {}px {}px {}px {}px !important;
-                    margin: {}px {}px {}px {}px !important;
-                    box-sizing: content-box !important;
-                }}
-                "#,
-            body_style.padding_top, body_style.padding_right, body_style.padding_bottom, body_style.padding_left,
-            body_style.margin_top, body_style.margin_right, body_style.margin_bottom, body_style.margin_left
-        );
-        css_rules.push_str(&container_css);
-    }
-
-    para_style.set_inner_html(&css_rules);
-
-    // flow spacing 변수
-    let flow_spacing = if let Some(body_style) = &sampling_data.body_style {
-        if body_style.padding_top > 0 || body_style.padding_bottom > 0 {
-            (body_style.padding_top + body_style.padding_bottom) / 2
-        } else { 24 }
-    } else { 24 };
-    let _ = style.set_property("--RS__flowSpacing", &format!("{}px", flow_spacing));
-
-    // DOM에 추가 후 측정
-    if let Some(body) = document.body() {
-        // A) 베이스라인
-        console_log!("📏 === 높이 측정 분석 시작 (fallback) ===");
-        let rect_a = html_element.get_bounding_client_rect();
-        let height_a = rect_a.height();
-        console_log!("📏 A 베이스라인 높이: {:.3}px", height_a);
-
-        // B) width/box-sizing
-        let _ = style.set_property("box-sizing", "content-box");
-        let _ = style.set_property("width", &format!("{}px", pure_content_width));
-        let _ = style.set_property("height", "auto");
-        let rect_b = html_element.get_bounding_client_rect();
-        let height_b = rect_b.height();
-        console_log!("📏 B width/box 적용 후: {:.3}px (ΔA→B: {:.3}px)", height_b, height_b - height_a);
-
-        // C) 인라인 타이포그래피 적용
-        let _ = style.set_property("font-family", &actual_font_family);
-        let _ = style.set_property("font-size", &format!("{}px", sampling_data.font_metrics.font_size));
-        let _ = style.set_property("line-height", &format!("{}px", sampling_data.font_metrics.line_height));
-        let _ = style.set_property("text-rendering", "optimizeLegibility");
-        let rect_c = html_element.get_bounding_client_rect();
-        let height_c = rect_c.height();
-        console_log!("📏 C 타이포 적용 후: {:.3}px (ΔB→C: {:.3}px, 누적 ΔA→C: {:.3}px)", height_c, height_c - height_b, height_c - height_a);
-
-        // D) 스타일시트 주입 + CSS 변수 적용
-        let head = document.get_elements_by_tag_name("head").get_with_index(0);
-        if let Some(head) = head {
-            let _ = head.append_child(&para_style);
-            console_log!("🎨 element 스타일 적용 완료 (fallback)");
-        }
-
-        // CSS 변수 적용
-        for (key, value) in &sampling_data.css_variables.vars {
-            let _ = style.set_property(key, value);
-        }
-        // :root에도 동일 변수 적용 (전역 규칙의 var() 해석용)
-        apply_css_variables_to_root(&document, &sampling_data.css_variables.vars);
-
-        // CSS 적용 상태 디버그 로그
-        debug_log_root_body(&window, &document);
-        debug_log_computed_styles(&window, &container);
-
-        let rect_d = html_element.get_bounding_client_rect();
-        let width_d = rect_d.width();
-        let height_d = rect_d.height();
-        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px), width: {:.3}px", height_d, height_d - height_c, height_d - height_a, width_d);
-
-        // 추가 디버그: container와 첫 요소의 column-gap, break-* 확인
-        if let Ok(Some(cs_cont)) = window.get_computed_style(&container) {
-            let gap = cs_cont.get_property_value("column-gap").unwrap_or_default();
-            let gap_px = parse_css_px(&gap);
-            let bi = cs_cont.get_property_value("break-inside").unwrap_or_default();
-            let ba = cs_cont.get_property_value("break-after").unwrap_or_default();
-            console_log!("🔎 [container] column-gap={} ({:.3}px), break-inside={}, break-after={}", gap, gap_px, bi, ba);
-        }
-        if let Ok(Some(first)) = container.query_selector("h1, h2, h3, figure, tr, hr, table, img") {
-            if let Some(first_el) = first.dyn_ref::<Element>() {
-                if let Ok(Some(cs)) = window.get_computed_style(first_el) {
-                    let tag = first_el.tag_name();
-                    let bi = cs.get_property_value("break-inside").unwrap_or_default();
-                    let ba = cs.get_property_value("break-after").unwrap_or_default();
-                    console_log!("🔎 [first:{}] break-inside={}, break-after={}", tag, bi, ba);
-                }
-            }
-        }
-
-        let measured_height = html_element.scroll_height() as f64;
-
-        console_log!("📏 최종 측정된 높이 (보정 포함): {:.3}px", measured_height);
-        
-        // 웹뷰 측정치(body 가장자리 마진 병합) 보정 (1차: computed style 기반)
-        let (mt_first, mb_last) = compute_outer_margins(&document, &window, &container);
-        let mut subtract_by = mt_first + mb_last;
-        if subtract_by > 0.0 {
-            console_log!("🔧 가장자리 마진 보정[computed]: top {:.3}px + bottom {:.3}px = {:.3}px", mt_first, mb_last, subtract_by);
-        }
-
-        // 보정값이 0일 경우, 기하학적 박스 차이로 재계산
-        if subtract_by == 0.0 {
-            let (gap_top, gap_bottom) = compute_outer_gaps_by_geometry(&window, &container);
-            if gap_top > 0.0 || gap_bottom > 0.0 {
-                console_log!("🔧 가장자리 갭 보정[geometry]: top {:.3}px + bottom {:.3}px = {:.3}px", gap_top, gap_bottom, gap_top + gap_bottom);
-            }
-            subtract_by = gap_top + gap_bottom;
-        }
-
-        // 과도한 보정을 방지: D−C로 클램프
-        let max_subtract = (height_d - height_c).max(0.0);
-        if subtract_by > max_subtract {
-            console_log!("🛡️ 보정값 클램프: {:.3}px → {:.3}px (최대 D−C)", subtract_by, max_subtract);
-            subtract_by = max_subtract;
-        }
-
-        let adjusted_height = (height_d - subtract_by).max(0.0);
-
-        let measured_height = adjusted_height;
-        let page_height = sampling_data.viewport_height as f64;
-
-        // cleanup
-        let _ = body.remove_child(&container);
-        if let Some(head) = document.get_elements_by_tag_name("head").get_with_index(0) {
-            let _ = head.remove_child(&para_style);
-        }
-
-        if page_height > 0.0 {
-            let total_pages = ((measured_height as f64) / page_height).ceil() as i32;
-            PageCalculationResult { total_pages: total_pages.max(1), status: "SUCCESS".to_string() }
-        } else {
-            PageCalculationResult { total_pages: 1, status: "SUCCESS".to_string() }
-        }
-    } else {
-        console_log!("❌ Document body를 찾을 수 없음");
-        PageCalculationResult { total_pages: 1, status: "ERROR".to_string() }
-    }
-}
+// (removed) calculate_pages_internal: fallback path no longer supported
 
 /// HTML 내용을 분석하여 마진 기여분을 계산
-fn analyze_html_content(document: &Document, sampling_data: &SamplingData) -> i32 {
+fn analyze_html_content(document: &Document, sampling_data: &SamplingData) {
     console_log!("📊 === HTML 내용 분석 ===");
     
     // 각 요소별 개수 세기
@@ -1252,64 +905,6 @@ fn analyze_html_content(document: &Document, sampling_data: &SamplingData) -> i3
     console_log!("  - p: {}개", p_count);
     console_log!("  - span: {}개", span_count);
     console_log!("  - div: {}개", div_count);
-    
-    // 마진 기여분 계산 (샘플링 데이터 기준)
-    let mut total_margin_contribution = 0;
-    
-    // h1 마진 기여
-    if h1_count > 0 {
-        // h1은 보통 큰 마진을 가짐 (h2보다 클 가능성)
-        let h1_margin = get_element_margin_from_styles(&sampling_data.element_styles, "h1", 48); // 기본값 48px
-        let h1_contribution = h1_count * h1_margin;
-        console_log!("  - h1 마진 기여: {}개 × {}px = {}px", h1_count, h1_margin, h1_contribution);
-        total_margin_contribution += h1_contribution;
-    }
-    
-    // h2 마진 기여
-    if h2_count > 0 {
-        let h2_margin = get_element_margin_from_styles(&sampling_data.element_styles, "h2", 38); // 기본값 38px
-        let h2_contribution = h2_count * h2_margin;
-        console_log!("  - h2 마진 기여: {}개 × {}px = {}px", h2_count, h2_margin, h2_contribution);
-        total_margin_contribution += h2_contribution;
-    }
-    
-    // h3 마진 기여
-    if h3_count > 0 {
-        let h3_margin = get_element_margin_from_styles(&sampling_data.element_styles, "h3", 24); // 기본값 24px
-        let h3_contribution = h3_count * h3_margin;
-        console_log!("  - h3 마진 기여: {}개 × {}px = {}px", h3_count, h3_margin, h3_contribution);
-        total_margin_contribution += h3_contribution;
-    }
-    
-    // p 마진 기여
-    if p_count > 0 {
-        let p_margin = get_element_margin_from_styles(&sampling_data.element_styles, "p", 0); // p는 보통 0
-        if p_margin > 0 {
-            let p_contribution = p_count * p_margin;
-            console_log!("  - p 마진 기여: {}개 × {}px = {}px", p_count, p_margin, p_contribution);
-            total_margin_contribution += p_contribution;
-        }
-    }
-    
-    // span 마진 기여
-    if span_count > 0 {
-        let span_margin = get_element_margin_from_styles(&sampling_data.element_styles, "span", 20); // 기본값 20px
-        let span_contribution = span_count * span_margin;
-        console_log!("  - span 마진 기여: {}개 × {}px = {}px", span_count, span_margin, span_contribution);
-        total_margin_contribution += span_contribution;
-    }
-    
-    // div 마진 기여
-    if div_count > 0 {
-        let div_margin = get_element_margin_from_styles(&sampling_data.element_styles, "div", 0); // div는 보통 0
-        if div_margin > 0 {
-            let div_contribution = div_count * div_margin;
-            console_log!("  - div 마진 기여: {}개 × {}px = {}px", div_count, div_margin, div_contribution);
-            total_margin_contribution += div_contribution;
-        }
-    }
-    
-    console_log!("🔢 총 마진 기여분: {}px", total_margin_contribution);
     
     // 실제 콘텐츠 분석
     let total_text_length = get_total_text_length(document);
@@ -1331,8 +926,6 @@ fn analyze_html_content(document: &Document, sampling_data: &SamplingData) -> i3
     analyze_special_structures(document);
     
     console_log!("📊 === HTML 분석 완료 ===");
-    
-    total_margin_contribution
 }
 
 /// elementStyles에서 특정 요소의 마진을 추출하는 헬퍼 함수
@@ -1437,73 +1030,4 @@ pub fn test_wasm_connection() -> String {
     "🦀 WASM 모듈이 정상적으로 연결되었습니다!".to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sampling_data_serialization() {
-        let sampling_data = SamplingData {
-            viewport_width: 800,
-            viewport_height: 600,
-            font_metrics: FontMetrics {
-                font_size: 16.0,
-                line_height: 24.0,
-                character_width: 8.0,
-            },
-            css_variables: CssVariables {
-                vars: HashMap::from([
-                    ("--RS__baseLineHeight".to_string(), "calc((1em + (2ex - 1ch) - ((1rem - 16px) * 0.1667)) * 1)".to_string()),
-                ]),
-            },
-            element_styles: HashMap::from([
-                ("h2".to_string(), HashMap::from([
-                    ("margin-top".to_string(), "19.92px".to_string()),
-                    ("margin-bottom".to_string(), "19.92px".to_string()),
-                ])),
-                ("span".to_string(), HashMap::from([
-                    ("margin-bottom".to_string(), "20px".to_string()),
-                ])),
-            ]),
-            body_style: Some(BodyStyle {
-                content_width: 780,
-                content_height: 580,
-                margin_top: 10,
-                margin_right: 10,
-                margin_bottom: 10,
-                margin_left: 10,
-                padding_top: 20,
-                padding_right: 20,
-                padding_bottom: 10,
-                padding_left: 10,
-            }),
-            root_style_attr: None,
-            document_lang: None,
-            document_dir: None,
-            document_writing_mode: None,
-        };
-
-        let json = serde_json::to_string(&sampling_data).unwrap();
-        let deserialized: SamplingData = serde_json::from_str(&json).unwrap();
-        
-        assert_eq!(sampling_data.viewport_width, deserialized.viewport_width);
-        assert_eq!(sampling_data.font_metrics.font_size, deserialized.font_metrics.font_size);
-        assert!(deserialized.body_style.is_some());
-        let body_style = deserialized.body_style.unwrap();
-        assert_eq!(body_style.content_width, 780);
-        assert_eq!(body_style.margin_top, 10);
-    }
-
-    #[test]
-    fn test_page_calculation_result() {
-        let result = PageCalculationResult {
-            total_pages: 5,
-            status: "SUCCESS".to_string(),
-        };
-
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("totalPages"));
-        assert!(json.contains("5"));
-        assert!(json.contains("SUCCESS"));
-    }
-}
+// (removed) tests module: referenced removed fields/types; keep code lean
