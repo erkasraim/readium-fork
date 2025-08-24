@@ -362,6 +362,18 @@ internal class EpubPageCalculationManager(
                     cssVariables: cssVariables,
                     elementStyles: elementStyles,
                     rootStyleAttr: rootStyleAttr,
+                    documentLang: (
+                        html.lang ||
+                        html.getAttribute('xml:lang') ||
+                        body.getAttribute('lang') ||
+                        (function(){
+                            var m = document.querySelector("meta[http-equiv='content-language']") || document.querySelector("meta[http-equiv='Content-Language']");
+                            return m ? (m.getAttribute('content')||'') : '';
+                        })() ||
+                        (navigator.language || '')
+                    ).trim(),
+                    documentDir: (html.dir || body.getAttribute('dir') || '').trim(),
+                    documentWritingMode: (window.getComputedStyle(html).writingMode || '').trim(),
                     bodyStyle: {
                         contentWidth: body.scrollWidth.toString(),
                         contentHeight: body.scrollHeight.toString(),

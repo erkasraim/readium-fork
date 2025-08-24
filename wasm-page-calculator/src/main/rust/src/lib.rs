@@ -173,6 +173,82 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
+/// 고급 타이포/렌더링 설정 및 폭 지표를 로깅
+fn debug_log_advanced_layout(window: &Window, document: &Document, container: &Element) {
+    // devicePixelRatio
+    let dpr = window.device_pixel_ratio();
+    console_log!("🖥️ devicePixelRatio={}", dpr);
+
+    // body: text-size-adjust 등과 width 지표
+    if let Some(body) = document.body() {
+        if let Ok(Some(cs)) = window.get_computed_style(&body) {
+            let tsa_wk = cs.get_property_value("-webkit-text-size-adjust").unwrap_or_default();
+            let tsa_std = cs.get_property_value("text-size-adjust").unwrap_or_default();
+            let tr = cs.get_property_value("text-rendering").unwrap_or_default();
+            let fk = cs.get_property_value("font-kerning").unwrap_or_default();
+            let ffs = cs.get_property_value("font-feature-settings").unwrap_or_default();
+            let fvl = cs.get_property_value("font-variant-ligatures").unwrap_or_default();
+            console_log!(
+                "🔧 [body] -webkit-text-size-adjust={}, text-size-adjust={}, text-rendering={}, font-kerning={}, font-feature-settings={}, font-variant-ligatures={}",
+                tsa_wk, tsa_std, tr, fk, ffs, fvl
+            );
+        }
+        if let Some(he) = body.dyn_ref::<HtmlElement>() {
+            console_log!(
+                "📐 [body widths] client={}px, scroll={}px",
+                he.client_width(), he.scroll_width()
+            );
+        }
+    }
+
+    // container: text-size-adjust 등과 width 지표
+    if let Ok(Some(cs)) = window.get_computed_style(container) {
+        let tsa_wk = cs.get_property_value("-webkit-text-size-adjust").unwrap_or_default();
+        let tsa_std = cs.get_property_value("text-size-adjust").unwrap_or_default();
+        let tr = cs.get_property_value("text-rendering").unwrap_or_default();
+        let fk = cs.get_property_value("font-kerning").unwrap_or_default();
+        let ffs = cs.get_property_value("font-feature-settings").unwrap_or_default();
+        let fvl = cs.get_property_value("font-variant-ligatures").unwrap_or_default();
+        console_log!(
+            "🔧 [container] -webkit-text-size-adjust={}, text-size-adjust={}, text-rendering={}, font-kerning={}, font-feature-settings={}, font-variant-ligatures={}",
+            tsa_wk, tsa_std, tr, fk, ffs, fvl
+        );
+    }
+    if let Some(he) = container.dyn_ref::<HtmlElement>() {
+        let rect = container.get_bounding_client_rect();
+        console_log!(
+            "📐 [container widths] client={}px, scroll={}px, bcr.width={}px",
+            he.client_width(), he.scroll_width(), rect.width()
+        );
+    }
+
+    // :root: text-size-adjust 등과 width 지표
+    if let Some(root) = document.document_element() {
+        if let Ok(Some(cs)) = window.get_computed_style(&root) {
+            let tsa_wk = cs.get_property_value("-webkit-text-size-adjust").unwrap_or_default();
+            let tsa_std = cs.get_property_value("text-size-adjust").unwrap_or_default();
+            let tr = cs.get_property_value("text-rendering").unwrap_or_default();
+            let fk = cs.get_property_value("font-kerning").unwrap_or_default();
+            let ffs = cs.get_property_value("font-feature-settings").unwrap_or_default();
+            let fvl = cs.get_property_value("font-variant-ligatures").unwrap_or_default();
+            console_log!(
+                "🔧 [:root] -webkit-text-size-adjust={}, text-size-adjust={}, text-rendering={}, font-kerning={}, font-feature-settings={}, font-variant-ligatures={}",
+                tsa_wk, tsa_std, tr, fk, ffs, fvl
+            );
+        }
+        if let Some(root_he) = root.dyn_ref::<HtmlElement>() {
+            console_log!(
+                "📐 [:root widths] client={}px, scroll={}px",
+                root_he.client_width(), root_he.scroll_width()
+            );
+        }
+    }
+}
+
+macro_rules! console_log {
+    ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
+}
+
 /// 주입된 CSS가 실제로 적용되었는지 확인하기 위한 디버그 로거
 fn debug_log_computed_styles(window: &Window, container: &Element) {
     // 컨테이너 자체 스타일
@@ -197,7 +273,7 @@ fn debug_log_computed_styles(window: &Window, container: &Element) {
     }
 
     // 첫 번째 in-flow 자손 엘리먼트 스타일
-    if let Ok(Some(first)) = container.query_selector(":scope p, :scope h1, :scope h2, :scope h3, :scope h4, :scope h5, :scope h6, :scope div, :scope section, :scope article, :scope blockquote, :scope ul, :scope ol, :scope li, :scope figure") {
+    if let Ok(Some(first)) = container.query_selector("h1, h2, h3, figure, tr, hr, table, img") {
         if let Some(first_el) = first.dyn_ref::<Element>() {
             if let Ok(Some(cs)) = window.get_computed_style(first_el) {
                 let tag = first_el.tag_name();
@@ -215,6 +291,9 @@ fn debug_log_computed_styles(window: &Window, container: &Element) {
                     "🔍 [first:{}] font={}, font-size={}, line-height={}, mt={}, mb={}, padding-left={}, padding-right={}, hyphens={}, letter-spacing={}, word-spacing={}",
                     tag, ff, fs, lh, mt, mb, pad_left, pad_right, hy, ls, ws
                 );
+                let bi = cs.get_property_value("break-inside").unwrap_or_default();
+                let ba = cs.get_property_value("break-after").unwrap_or_default();
+                console_log!("🔎 [first:{}] break-inside={}, break-after={}, -webkit-column-break-inside={}, -webkit-column-break-after={}", tag, bi, ba, cs.get_property_value("-webkit-column-break-inside").unwrap_or_default(), cs.get_property_value("-webkit-column-break-after").unwrap_or_default());
             }
         }
     }
@@ -260,6 +339,78 @@ fn debug_log_root_body(window: &Window, document: &Document) {
     }
 }
 
+//// Paged 모드에서 :root에 멀티컬럼과 100vh 높이를 강제 적용
+fn inject_paged_root_css(sheet_el: &HtmlElement, viewport_height: i32) {
+    let scoped = format!(
+        r#"
+    :root[data-wasm-paged] {{
+        /* 높이: 100vh + px fallback (마지막 규칙 우선) */
+        height: 100vh !important;
+        max-height: 100vh !important;
+        min-height: 100vh !important;
+        height: {vh}px !important;
+        max-height: {vh}px !important;
+        min-height: {vh}px !important;
+
+        /* 멀티컬럼 */
+        -webkit-column-fill: auto !important;
+        column-fill: auto !important;
+        -webkit-column-width: var(--RS__colWidth) !important;
+        column-width: var(--RS__colWidth) !important;
+        -webkit-column-gap: var(--RS__colGap) !important;
+        column-gap: var(--RS__colGap) !important;
+        -webkit-column-count: var(--RS__colCount) !important;
+        column-count: var(--RS__colCount) !important;
+
+        /* 박스 모델 안정화 */
+        box-sizing: border-box !important;
+    }}
+    "#,
+        vh = viewport_height
+    );
+    let new_inner = format!("{}\n{}", sheet_el.inner_html(), scoped);
+    sheet_el.set_inner_html(&new_inner);
+    console_log!("🧩 paged 모드 :root 멀티컬럼+뷰포트 높이 강제 적용");
+}
+
+// Scroll 모드에서 WebView와의 폭/거터 정합성을 맞추기 위한 최소 보정을 주입
+fn inject_scroll_mode_container_css(sheet_el: &HtmlElement) {
+    // 컨테이너에 body의 레이아웃 핵심 속성(max-width, page gutter)을 반영
+    let scoped = r#"
+    div[data-wasm-container] {
+        width: 100% !important;
+        max-width: var(--RS__maxLineLength) !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        box-sizing: border-box !important;
+        padding-left:  calc(var(--RS__pageGutter) * var(--USER__pageMargins, 1)) !important;
+        padding-right: calc(var(--RS__pageGutter) * var(--USER__pageMargins, 1)) !important;
+    }
+    "#;
+    let new_inner = format!("{}\n{}", sheet_el.inner_html(), scoped);
+    sheet_el.set_inner_html(&new_inner);
+    console_log!("🛠️ scroll 모드 컨테이너 보정(max-width, page gutter) 적용");
+}
+
+/// Paged 모드에서 컨테이너 폭/거터를 최소한으로 반영해 높이 측정 보정
+fn inject_paged_mode_container_css(sheet_el: &HtmlElement) {
+    // columns 는 :root 가 담당하므로 여기서는 폭/거터만 최소 반영
+    // 주의: body가 이미 max-width와 page gutter를 적용하므로, 중복을 피하기 위해 padding/max-width는 주입하지 않음
+    let scoped = r#"
+    div[data-wasm-container] {
+        width: 100% !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        box-sizing: border-box !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+    "#;
+    let new_inner = format!("{}\n{}", sheet_el.inner_html(), scoped);
+    sheet_el.set_inner_html(&new_inner);
+    console_log!("🛠️ paged 모드 컨테이너 보정(width, center, box-sizing만) 적용");
+}
+
 /// 샘플링 데이터 구조체 (Kotlin과 동일)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SamplingData {
@@ -277,6 +428,12 @@ pub struct SamplingData {
     pub body_style: Option<BodyStyle>,
     #[serde(rename = "rootStyleAttr")]
     pub root_style_attr: Option<String>,
+    #[serde(rename = "documentLang")]
+    pub document_lang: Option<String>,
+    #[serde(rename = "documentDir")]
+    pub document_dir: Option<String>,
+    #[serde(rename = "documentWritingMode")]
+    pub document_writing_mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -438,6 +595,50 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
     // CSS 스타일 적용
     let html_element = container.dyn_ref::<HtmlElement>().unwrap();
     let style = html_element.style();
+    // 언어 결정 (샘플링 → DOM → navigator 순으로 fallback)
+    let mut effective_lang = sampling_data.document_lang.clone().unwrap_or_default();
+    if effective_lang.is_empty() {
+        // try existing DOM attrs first
+        if let Some(root) = document.document_element() {
+            if effective_lang.is_empty() {
+                effective_lang = root.get_attribute("lang").unwrap_or_default();
+            }
+        }
+        if effective_lang.is_empty() {
+            if let Some(b) = document.body() {
+                effective_lang = b.get_attribute("lang").unwrap_or_default();
+            }
+        }
+        // try meta http-equiv=content-language
+        if effective_lang.is_empty() {
+            if let Ok(Some(meta)) = document.query_selector("meta[http-equiv='content-language']") {
+                effective_lang = meta.get_attribute("content").unwrap_or_default();
+            } else if let Ok(Some(meta)) = document.query_selector("meta[http-equiv='Content-Language']") {
+                effective_lang = meta.get_attribute("content").unwrap_or_default();
+            }
+        }
+    }
+    // 언어/방향/쓰기모드(데이터 속성) 복제 및 로깅
+    if !effective_lang.is_empty() { let _ = html_element.set_attribute("lang", &effective_lang); }
+    if let Some(dir) = sampling_data.document_dir.as_ref() {
+        if !dir.is_empty() { let _ = html_element.set_attribute("dir", dir); }
+    }
+    if let Some(wm) = sampling_data.document_writing_mode.as_ref() {
+        if !wm.is_empty() { let _ = html_element.set_attribute("data-writing-mode", wm); }
+    }
+    let applied_lang = html_element.get_attribute("lang").unwrap_or_default();
+    let applied_dir = html_element.get_attribute("dir").unwrap_or_default();
+    let applied_wm_attr = html_element.get_attribute("data-writing-mode").unwrap_or_default();
+    let wm_computed = window
+        .get_computed_style(&container)
+        .ok()
+        .flatten()
+        .map(|cs| cs.get_property_value("writing-mode").unwrap_or_default())
+        .unwrap_or_default();
+    console_log!(
+        "🧾 [container attrs] lang='{}', dir='{}', data-writing-mode='{}' | computed writing-mode='{}'",
+        applied_lang, applied_dir, applied_wm_attr, wm_computed
+    );
     
     // wrapper 스타일 핸들
     let wrapper_html = wrapper.dyn_ref::<HtmlElement>().unwrap();
@@ -455,20 +656,45 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
 
     // 기본 레이아웃 스타일 (이전: 컨테이너에 적용하던 오프스크린 고정 → 이제 래퍼에 적용)
     // wrapper를 오프스크린 고정 + 뷰포트 폭 고정
-    wrapper_style.set_css_text(&format!(
-        "position:fixed !important; \
-         top:-10000px !important; \
-         left:0 !important; \
-         visibility:hidden !important; \
-         display:block !important; \
-         box-sizing:content-box !important; \
-         width:{}px !important; \
-         max-width:none !important; \
-         min-width:0 !important; \
-         overflow:visible !important;",
-        sampling_data.viewport_width
-    ));
-    
+    // 모드 판별 (wrapper 레이아웃 결정에 사용)
+    let user_view_mode = sampling_data.css_variables.vars.get("--USER__view").cloned();
+    let is_scroll_mode_for_wrapper = user_view_mode
+        .as_ref()
+        .map(|v| v.contains("readium-scroll-on"))
+        .or_else(|| sampling_data.root_style_attr.as_ref().map(|s| s.contains("readium-scroll-on")))
+        .unwrap_or(false);
+
+    // 기본 레이아웃 스타일: 모드별 wrapper 배치
+    if is_scroll_mode_for_wrapper {
+        // scroll 모드: 오프스크린 고정 + 뷰포트 폭 고정 (기존 동작)
+        wrapper_style.set_css_text(&format!(
+            "position:fixed !important; \
+             top:-10000px !important; \
+             left:0 !important; \
+             visibility:hidden !important; \
+             display:block !important; \
+             box-sizing:content-box !important; \
+             width:{}px !important; \
+             max-width:none !important; \
+             min-width:0 !important; \
+             overflow:visible !important;",
+            sampling_data.viewport_width
+        ));
+    } else {
+        // paged 모드: :root의 컬럼/100vh 규칙이 하위에 적용되도록 in-flow로 배치
+        // 화면 영향은 visibility:hidden으로 최소화
+        wrapper_style.set_css_text(
+            "position:static !important; \
+             visibility:hidden !important; \
+             display:block !important; \
+             box-sizing:content-box !important; \
+             width:100% !important; \
+             max-width:none !important; \
+             min-width:0 !important; \
+             overflow:visible !important;",
+        );
+    }
+
     // 기본값 설정 (body_style이 없을 경우 대비)
     let mut actual_padding_left = 0;
     let mut actual_padding_right = 0;
@@ -528,14 +754,37 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
         // :root style 토글 복제는 반드시 측정 전에 적용되어야 함
         let root_el = document.document_element();
         let mut prev_root_style: Option<String> = None;
+        let mut prev_root_lang: Option<String> = None;
+        let mut prev_root_dir: Option<String> = None;
+        let mut prev_root_wm_attr: Option<String> = None;
         if let Some(root) = &root_el {
             prev_root_style = root.get_attribute("style");
+            prev_root_lang = root.get_attribute("lang");
+            prev_root_dir = root.get_attribute("dir");
+            prev_root_wm_attr = root.get_attribute("data-writing-mode");
             if let Some(style_attr) = &sampling_data.root_style_attr {
                 let _ = root.set_attribute("style", style_attr);
                 console_log!("🧭 :root style 복제 적용: {}", style_attr);
             }
+            // :root에 언어/방향/쓰기모드 데이터 속성도 반영 (언어 기반 var 적용 보장)
+            if !effective_lang.is_empty() { let _ = root.set_attribute("lang", &effective_lang); }
+            if let Some(dir) = sampling_data.document_dir.as_ref() { if !dir.is_empty() { let _ = root.set_attribute("dir", dir); } }
+            if let Some(wm) = sampling_data.document_writing_mode.as_ref() { if !wm.is_empty() { let _ = root.set_attribute("data-writing-mode", wm); } }
+            // 로깅: :root에 실제로 적용된 값과 computed writing-mode
+            let applied_root_lang = root.get_attribute("lang").unwrap_or_default();
+            let applied_root_dir = root.get_attribute("dir").unwrap_or_default();
+            let applied_root_wm = root.get_attribute("data-writing-mode").unwrap_or_default();
+            let root_wm_computed = window
+                .get_computed_style(root)
+                .ok()
+                .flatten()
+                .map(|cs| cs.get_property_value("writing-mode").unwrap_or_default())
+                .unwrap_or_default();
+            console_log!(
+                "🧾 [:root attrs] lang='{}', dir='{}', data-writing-mode='{}' | computed writing-mode='{}'",
+                applied_root_lang, applied_root_dir, applied_root_wm, root_wm_computed
+            );
         }
-        
         if let Err(_) = wrapper.append_child(&container) {
             console_log!("❌ 래퍼에 컨테이너 추가 실패");
             return PageCalculationResult {
@@ -587,100 +836,123 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
         
         // 컨테이너 스코프에서 타이포그래피/바디 레이아웃 보정 규칙 추가
         if let Some(sheet_el) = para_style.dyn_ref::<HtmlElement>() {
-            let mut scoped = String::new();
-            scoped.push_str(r#"
-            div[data-wasm-container] {
-                /* USER 우선 적용 */
-                font-family: var(--USER__fontFamily, var(--RS__baseFontFamily)) !important;
-                font-size: var(--USER__fontSize, 100%) !important;
-                line-height: var(--USER__lineHeight, var(--RS__baseLineHeight)) !important;
+            // 모드 판별: 우선 --USER__view, 없으면 rootStyleAttr 사용
+            let user_view = sampling_data.css_variables.vars.get("--USER__view").cloned();
+            let is_scroll_mode = user_view
+                .as_ref()
+                .map(|v| v.contains("readium-scroll-on"))
+                .or_else(|| sampling_data.root_style_attr.as_ref().map(|s| s.contains("readium-scroll-on")))
+                .unwrap_or(false);
+            console_log!("🧭 감지된 모드: {}", if is_scroll_mode { "scroll" } else { "paged" });
 
-                /* 페이지 거터 = RS__pageGutter × USER__pageMargins */
-                padding-left:  calc(var(--RS__pageGutter) * var(--USER__pageMargins, 1)) !important;
-                padding-right: calc(var(--RS__pageGutter) * var(--USER__pageMargins, 1)) !important;
-
-                /* 스페이싱/하이픈 (읽기 설정 반영) */
-                letter-spacing: var(--USER__letterSpacing, normal) !important;
-                word-spacing:   var(--USER__wordSpacing, 0px) !important;
-                hyphens: var(--USER__bodyHyphens, manual) !important;
-
-                /* 나머지 레이아웃 */
-                width: 100% !important;
-                max-width: var(--RS__maxLineLength) !important;
-                margin-left: auto !important;
-                margin-right: auto !important;
-                box-sizing: border-box !important;
-                column-width: auto !important;
-                column-count: auto !important;
-                column-gap: normal !important;
+            if is_scroll_mode {
+                inject_scroll_mode_container_css(sheet_el);
+            } else {
+                // Paged 모드: 최소 폭/거터만 반영(컬럼은 :root가 처리)
+                inject_paged_mode_container_css(sheet_el);
+                // :root에 측정 전용 스코프 속성 부여 + 멀티컬럼/높이 강제
+                if let Some(root) = document.document_element() {
+                    let _ = root.set_attribute("data-wasm-paged", "on");
+                }
+                inject_paged_root_css(sheet_el, sampling_data.viewport_height);
             }
-            /* 미디어/테이블(안전망) */
-            div[data-wasm-container] img,
-            div[data-wasm-container] svg,
-            div[data-wasm-container] video,
-            div[data-wasm-container] audio {
-                object-fit: contain !important;
-                width: auto !important;
-                height: auto !important;
-                max-width: var(--RS__maxMediaWidth, 100%) !important;
-                max-height: var(--RS__maxMediaHeight, 95vh) !important;
-                box-sizing: var(--RS__boxSizingMedia, border-box) !important;
-            }
-            div[data-wasm-container] table {
-                max-width: var(--RS__maxMediaWidth, 100%) !important;
-                box-sizing: var(--RS__boxSizingTable, border-box) !important;
-            }
-            "#);
-            // 기존 규칙 뒤에 추가 주입
-            let new_inner = format!("{}\n{}", para_style.inner_html(), scoped);
-            sheet_el.set_inner_html(&new_inner);
         }
 
         // CSS 적용 상태 디버그 로그
         debug_log_root_body(&window, &document);
         debug_log_computed_styles(&window, &container);
+        debug_log_advanced_layout(&window, &document, &container);
+
+        // 추가 디버그: :root 컬럼 지표 및 라인하이트 보정 var
+        if let Some(root) = document.document_element() {
+            if let Ok(Some(cs)) = window.get_computed_style(&root) {
+                let cw = cs.get_property_value("column-width").unwrap_or_default();
+                let cc = cs.get_property_value("column-count").unwrap_or_default();
+                let cg = cs.get_property_value("column-gap").unwrap_or_default();
+                let h = cs.get_property_value("height").unwrap_or_default();
+                console_log!("🔎 [:root] column-width={}, column-count={}, column-gap={}, height={}", cw, cc, cg, h);
+                let lhc = cs.get_property_value("--RS__lineHeightCompensation").unwrap_or_default();
+                console_log!("🔎 [:root] --RS__lineHeightCompensation={}", lhc);
+            }
+        }
 
         let rect_d = html_element.get_bounding_client_rect();
         let width_d = rect_d.width();
         let height_d = rect_d.height();
         console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px), width: {:.3}px", height_d, height_d - height_c, height_d - height_a, width_d);
 
-        let measured_height = html_element.scroll_height() as f64;
-        console_log!("📏 최종 측정된 높이 (보정 포함): {:.3}px", measured_height);
+        // 추가 디버그: container와 첫 요소의 column-gap, break-* 확인
+        if let Ok(Some(cs_cont)) = window.get_computed_style(&container) {
+            let gap = cs_cont.get_property_value("column-gap").unwrap_or_default();
+            let gap_px = parse_css_px(&gap);
+            let bi = cs_cont.get_property_value("break-inside").unwrap_or_default();
+            let ba = cs_cont.get_property_value("break-after").unwrap_or_default();
+            console_log!("🔎 [container] column-gap={} ({:.3}px), break-inside={}, break-after={}", gap, gap_px, bi, ba);
+        }
+        if let Ok(Some(first)) = container.query_selector("h1, h2, h3, figure, tr, hr, table, img") {
+            if let Some(first_el) = first.dyn_ref::<Element>() {
+                if let Ok(Some(cs)) = window.get_computed_style(first_el) {
+                    let tag = first_el.tag_name();
+                    let bi = cs.get_property_value("break-inside").unwrap_or_default();
+                    let ba = cs.get_property_value("break-after").unwrap_or_default();
+                    console_log!("🔎 [first:{}] break-inside={}, break-after={}", tag, bi, ba);
+                }
+            }
+        }
 
-        // 실제 높이 측정 및 보정
-        console_log!("📏 === 높이 측정 분석 완료 ===");
+        let mut measured_height = html_element.scroll_height() as f64;
+        let mut measured_max = measured_height;
+        // wrapper
+        let candidate_wrapper = wrapper
+            .dyn_ref::<HtmlElement>()
+            .map(|e| e.scroll_height() as f64)
+            .unwrap_or(0.0);
+        measured_max = measured_max.max(candidate_wrapper);
+        // body
+        let candidate_body = document
+            .body()
+            .map(|b| b.scroll_height() as f64)
+            .unwrap_or(0.0);
+        measured_max = measured_max.max(candidate_body);
+        // documentElement(:root)
+        let candidate_root = {
+            if let Some(root_el) = document.document_element() {
+                if let Some(root_html) = root_el.dyn_ref::<HtmlElement>() {
+                    root_html.scroll_height() as f64
+                } else { 0.0 }
+            } else { 0.0 }
+        };
+        measured_max = measured_max.max(candidate_root);
+        let candidate_container = html_element.scroll_height() as f64;
+        console_log!(
+            "📐 scrollHeight candidates px → container={:.3}, wrapper(max)={:.3}, body={:.3}, root={:.3}",
+            candidate_container,
+            candidate_wrapper,
+            candidate_body,
+            candidate_root
+        );
+        measured_height = measured_max;
+
+        console_log!("📏 최종 측정된 높이 (보정 포함): {:.3}px", measured_height);
         
         let page_height = sampling_data.viewport_height as f64;
-        console_log!("📄 페이지 높이: {}px (뷰포트 높이 사용)", page_height);
 
-        // DOM에서 제거
+        // cleanup
         let _ = body.remove_child(&wrapper);
-        // 스타일 제거
         if let Some(head) = document.get_elements_by_tag_name("head").get_with_index(0) {
             let _ = head.remove_child(&para_style);
         }
+        // :root attr 원복
+        if let Some(root) = &root_el {
+            match prev_root_lang { Some(v) => { let _ = root.set_attribute("lang", &v); }, None => { let _ = root.remove_attribute("lang"); } }
+            match prev_root_dir { Some(v) => { let _ = root.set_attribute("dir", &v); }, None => { let _ = root.remove_attribute("dir"); } }
+            match prev_root_wm_attr { Some(v) => { let _ = root.set_attribute("data-writing-mode", &v); }, None => { let _ = root.remove_attribute("data-writing-mode"); } }
+            let _ = root.remove_attribute("data-wasm-paged");
+        }
 
-        // 페이지 수 계산 (올림 처리)
         if page_height > 0.0 {
             let total_pages = ((measured_height as f64) / page_height).ceil() as i32;
-            let final_pages = total_pages.max(1);
-            
-            console_log!("✅ 계산된 페이지 수: {}", final_pages);
-            
-            // :root style 원복
-            if let Some(root) = root_el {
-                match prev_root_style {
-                    Some(orig) => { let _ = root.set_attribute("style", &orig); },
-                    None => { let _ = root.remove_attribute("style"); }
-                }
-                console_log!("🧭 :root style 원복 완료");
-            }
-
-            PageCalculationResult {
-                total_pages: final_pages,
-                status: "SUCCESS".to_string(),
-            }
+            PageCalculationResult { total_pages: total_pages.max(1), status: "SUCCESS".to_string() }
         } else {
             console_log!("⚠️ 페이지 높이가 0 - 기본값 1 반환");
             PageCalculationResult {
@@ -846,11 +1118,6 @@ fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCal
 
     // DOM에 추가 후 측정
     if let Some(body) = document.body() {
-        if let Err(_) = body.append_child(&container) {
-            console_log!("❌ DOM 추가 실패");
-            return PageCalculationResult { total_pages: 1, status: "ERROR".to_string() };
-        }
-
         // A) 베이스라인
         console_log!("📏 === 높이 측정 분석 시작 (fallback) ===");
         let rect_a = html_element.get_bounding_client_rect();
@@ -893,9 +1160,33 @@ fn calculate_pages_internal(html: &str, sampling_data: &SamplingData) -> PageCal
         debug_log_computed_styles(&window, &container);
 
         let rect_d = html_element.get_bounding_client_rect();
+        let width_d = rect_d.width();
         let height_d = rect_d.height();
-        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px)", height_d, height_d - height_c, height_d - height_a);
+        console_log!("📏 D 스타일시트/변수 적용 후: {:.3}px (ΔC→D: {:.3}px, 누적 ΔA→D: {:.3}px), width: {:.3}px", height_d, height_d - height_c, height_d - height_a, width_d);
 
+        // 추가 디버그: container와 첫 요소의 column-gap, break-* 확인
+        if let Ok(Some(cs_cont)) = window.get_computed_style(&container) {
+            let gap = cs_cont.get_property_value("column-gap").unwrap_or_default();
+            let gap_px = parse_css_px(&gap);
+            let bi = cs_cont.get_property_value("break-inside").unwrap_or_default();
+            let ba = cs_cont.get_property_value("break-after").unwrap_or_default();
+            console_log!("🔎 [container] column-gap={} ({:.3}px), break-inside={}, break-after={}", gap, gap_px, bi, ba);
+        }
+        if let Ok(Some(first)) = container.query_selector("h1, h2, h3, figure, tr, hr, table, img") {
+            if let Some(first_el) = first.dyn_ref::<Element>() {
+                if let Ok(Some(cs)) = window.get_computed_style(first_el) {
+                    let tag = first_el.tag_name();
+                    let bi = cs.get_property_value("break-inside").unwrap_or_default();
+                    let ba = cs.get_property_value("break-after").unwrap_or_default();
+                    console_log!("🔎 [first:{}] break-inside={}, break-after={}", tag, bi, ba);
+                }
+            }
+        }
+
+        let measured_height = html_element.scroll_height() as f64;
+
+        console_log!("📏 최종 측정된 높이 (보정 포함): {:.3}px", measured_height);
+        
         // 웹뷰 측정치(body 가장자리 마진 병합) 보정 (1차: computed style 기반)
         let (mt_first, mb_last) = compute_outer_margins(&document, &window, &container);
         let mut subtract_by = mt_first + mb_last;
@@ -1187,6 +1478,9 @@ mod tests {
                 padding_left: 10,
             }),
             root_style_attr: None,
+            document_lang: None,
+            document_dir: None,
+            document_writing_mode: None,
         };
 
         let json = serde_json::to_string(&sampling_data).unwrap();
