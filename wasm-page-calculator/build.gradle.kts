@@ -109,6 +109,10 @@ tasks.register<Exec>("buildWasm") {
                     window.test_wasm_connection = wasm_bindgen.test_wasm_connection || wasm_bindgen.__exports?.test_wasm_connection;
                     window.initSync = wasm_bindgen.initSync || wasm_bindgen.initSync;
                     window.__wbg_init = wasm_bindgen || wasm_bindgen;
+
+                    // 새 레지스트리 기반 API 노출
+                    window.register_css_registry = wasm_bindgen.register_css_registry || wasm_bindgen.__exports?.register_css_registry;
+                    window.calculate_pages_with_registry = wasm_bindgen.calculate_pages_with_registry || wasm_bindgen.__exports?.calculate_pages_with_registry;
                 }
                 """.trimIndent()
 

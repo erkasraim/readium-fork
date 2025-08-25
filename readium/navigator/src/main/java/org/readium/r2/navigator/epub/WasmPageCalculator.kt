@@ -109,6 +109,21 @@ internal interface WasmPageCalculator {
     ): WasmCalculationResult
 
     /**
+     * Register a CSS registry once per publication.
+     */
+    suspend fun registerCssRegistry(registryJson: String): Boolean
+
+    /**
+     * Calculate pages using registry-based bundling.
+     */
+    suspend fun calculatePagesWithRegistry(
+        html: String,
+        hrefsJson: String,
+        inlineStylesJson: String,
+        samplingJson: String
+    ): WasmCalculationResult
+
+    /**
      * Initialize WASM module if needed.
      */
     suspend fun initialize(): Boolean
@@ -237,6 +252,92 @@ internal class DefaultWasmPageCalculator(
                 status = WasmCalculationResult.Status.FALLBACK_NEEDED,
                 measuredHeight = 0.0
             )
+        }
+    }
+
+    override suspend fun registerCssRegistry(registryJson: String): Boolean =
+        withContext(Dispatchers.Main) {
+            if (!isInitialized || wasmWebView == null) return@withContext false
+            try {
+                suspendCancellableCoroutine { cont ->
+                    val arg = JSONObject.quote(registryJson)
+                    val js =
+                        "typeof window.register_css_registry === 'function' ? window.register_css_registry($arg) : false"
+                    wasmWebView!!.evaluateJavascript(js) { result ->
+                        val ok = result == "true"
+                        cont.resume(ok)
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w("WasmPageCalculator", "registerCssRegistry 실패: ${t.message}")
+                false
+            }
+        }
+
+    override suspend fun calculatePagesWithRegistry(
+        html: String,
+        hrefsJson: String,
+        inlineStylesJson: String,
+        samplingJson: String
+    ): WasmCalculationResult = withContext(Dispatchers.Main) {
+        if (!isInitialized || wasmWebView == null) {
+            Log.w("WasmPageCalculator", "⚠️ WASM 미초기화, fallback 사용")
+            return@withContext WasmCalculationResult(
+                totalPages = estimatePages(html, samplingJson),
+                status = WasmCalculationResult.Status.FALLBACK_NEEDED,
+                measuredHeight = 0.0
+            )
+        }
+        try {
+            val htmlJs = JSONObject.quote(html)
+            val hrefsJs = JSONObject.quote(hrefsJson)
+            val inlineJs = JSONObject.quote(inlineStylesJson)
+            val samplingJs = JSONObject.quote(samplingJson)
+            val jsCode =
+                "(function(){ if(typeof window.calculate_pages_with_registry!== 'function'){ return null;} return window.calculate_pages_with_registry($htmlJs,$hrefsJs,$inlineJs,$samplingJs, ${if (enableDebugLogs) "true" else "false"}); })()"
+            suspendCancellableCoroutine { cont ->
+                wasmWebView!!.evaluateJavascript(jsCode) { result ->
+                    if (result != null && result != "null") {
+                        val cleanResult = result.removePrefix("\"").removeSuffix("\"")
+                            .replace("\\\"", "\"")
+                            .replace("\\n", "\n")
+                        cont.resume(
+                            WasmCalculationResult(
+                                totalPages = try {
+                                    JSONObject(cleanResult).optInt("totalPages", 1)
+                                } catch (_: Throwable) {
+                                    1
+                                },
+                                status = try {
+                                    if (JSONObject(cleanResult).optString(
+                                            "status",
+                                            "ERROR"
+                                        ) == "SUCCESS"
+                                    ) WasmCalculationResult.Status.SUCCESS else WasmCalculationResult.Status.ERROR
+                                } catch (_: Throwable) {
+                                    WasmCalculationResult.Status.ERROR
+                                },
+                                measuredHeight = try {
+                                    JSONObject(cleanResult).optDouble("measured_height", 0.0)
+                                } catch (_: Throwable) {
+                                    0.0
+                                }
+                            )
+                        )
+                    } else {
+                        cont.resume(
+                            WasmCalculationResult(
+                                1,
+                                WasmCalculationResult.Status.FALLBACK_NEEDED,
+                                0.0
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w("WasmPageCalculator", "calculatePagesWithRegistry 실패: ${t.message}")
+            WasmCalculationResult(1, WasmCalculationResult.Status.FALLBACK_NEEDED, 0.0)
         }
     }
 
@@ -446,6 +547,21 @@ internal class DefaultWasmPageCalculator(
                                 }
                             };
 
+                            // 새: 레지스트리 등록/레지스트리 기반 계산 래퍼
+                            window.registerCssRegistryWasm = function(registryJson) {
+                                try {
+                                    if (typeof window.register_css_registry !== 'function') return false;
+                                    return !!window.register_css_registry(registryJson);
+                                } catch (e) { return false; }
+                            };
+                            window.calculatePagesWithRegistryWasm = function(html, hrefsJson, inlineStylesJson, samplingDataJson, debugLogging) {
+                                try {
+                                    if (!wasmInitialized) throw new Error('WASM 모듈이 초기화되지 않음');
+                                    if (typeof window.calculate_pages_with_registry !== 'function') return null;
+                                    return window.calculate_pages_with_registry(html, hrefsJson, inlineStylesJson, samplingDataJson, !!debugLogging);
+                                } catch (e) { return null; }
+                            };
+
                             // 테스트 함수 (간단 참조)
                             window.testWasm = function() {
                                 try {
@@ -526,7 +642,7 @@ internal class DefaultWasmPageCalculator(
                 // 첫 번째 체크를 Handler로 스케줄링
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                     checkInitialization()
-                }, 1000)
+                }, 1000) // TODO : 1초 안해도 되지않나??
             } catch (e: Exception) {
                 Log.e("WasmPageCalculator", "WASM 모듈 로드 실패", e)
                 continuation.resume(false)

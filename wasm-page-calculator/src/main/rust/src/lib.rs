@@ -1250,3 +1250,101 @@ fn transform_imgs_to_placeholders(
         }
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CssRegistryEntry {
+    #[serde(rename = "baseHref")] 
+    base_href: String,
+    text: String,
+}
+
+thread_local! {
+    static CSS_REGISTRY: std::cell::RefCell<HashMap<String, CssRegistryEntry>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[wasm_bindgen]
+pub fn register_css_registry(registry_json: &str) -> bool {
+    set_debug_logging(is_debug_logging_enabled());
+    let parsed: HashMap<String, CssRegistryEntry> = match serde_json::from_str(registry_json) {
+        Ok(m) => m,
+        Err(e) => {
+            console_log!("❌ CSS 레지스트리 JSON 파싱 실패: {}", e);
+            return false;
+        }
+    };
+
+    let count = parsed.len();
+    CSS_REGISTRY.with(|cell| {
+        let mut map = cell.borrow_mut();
+        map.clear();
+        map.extend(parsed);
+    });
+    console_log!("📦 CSS 레지스트리 등록 완료: {} 항목", count);
+    true
+}
+
+#[wasm_bindgen]
+pub fn calculate_pages_with_registry(
+    html: &str,
+    hrefs_json: &str,
+    inline_styles_json: &str,
+    sampling_data_json: &str,
+    debug_logging: bool,
+) -> String {
+    set_debug_logging(debug_logging);
+    console_log!("🦀 WASM calculate_pages_with_registry 호출됨");
+    console_log!("HTML 길이: {} chars", html.len());
+    console_log!("hrefs JSON 길이: {} chars", hrefs_json.len());
+    console_log!("inline styles JSON 길이: {} chars", inline_styles_json.len());
+
+    // 샘플링 데이터 파싱
+    let sampling_data: SamplingData = match serde_json::from_str(sampling_data_json) {
+        Ok(data) => data,
+        Err(e) => {
+            console_log!("❌ JSON 파싱 실패(sampling): {}", e);
+            let error_result = PageCalculationResult {
+                total_pages: 0,
+                measured_height: 0.0,
+                status: "ERROR".to_string(),
+            };
+            return serde_json::to_string(&error_result).unwrap_or_default();
+        }
+    };
+
+    // hrefs/inline styles 파싱
+    let hrefs: Vec<String> = serde_json::from_str(hrefs_json).unwrap_or_else(|e| {
+        console_log!("⚠️ hrefs 파싱 실패: {}", e);
+        Vec::new()
+    });
+    let inline_styles: Vec<String> = serde_json::from_str(inline_styles_json).unwrap_or_else(|e| {
+        console_log!("⚠️ inline styles 파싱 실패: {}", e);
+        Vec::new()
+    });
+
+    // 번들 생성: 레지스트리 기반으로 href 순서대로 결합 + 인라인 스타일을 마지막에
+    let mut css_text = String::new();
+    CSS_REGISTRY.with(|cell| {
+        let map = cell.borrow();
+        for href in &hrefs {
+            if let Some(entry) = map.get(href) {
+                css_text.push_str(&format!("/* [href: {}] */\n", href));
+                css_text.push_str(&entry.text);
+                css_text.push_str("\n\n");
+            } else {
+                console_log!("⚠️ CSS 레지스트리 누락: {}", href);
+            }
+        }
+    });
+    if !inline_styles.is_empty() {
+        css_text.push_str("/* [inline styles] */\n");
+        for s in inline_styles {
+            css_text.push_str(&s);
+            css_text.push_str("\n\n");
+        }
+    }
+
+    // 기존 경로 재사용
+    let result = calculate_pages_internal_with_css(html, &css_text, &sampling_data);
+    serde_json::to_string(&result).unwrap_or_default()
+}

@@ -20,6 +20,7 @@ import org.readium.r2.navigator.pager.R2EpubPageFragment
 import org.readium.r2.shared.InternalReadiumApi
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.Link
+import java.net.URI
 
 /**
  * Manager for calculating total pages in EPUB publications using WASM-based approach.
@@ -39,6 +40,15 @@ internal class EpubPageCalculationManager(
 
     // Cache of image dimensions for all EPUB-internal images. Built once, reused.
     private var imageDimensionsCache: JSONObject? = null
+
+    // Cache: whether CSS registry has been registered to WASM for this publication.
+    private var cssRegistryRegistered: Boolean = false
+
+    // Synthetic registry keys for app-asset Readium CSS
+    private val REGKEY_ASSET_BEFORE = "@assets/readium/readium-css/ReadiumCSS-before.css"
+    private val REGKEY_ASSET_AFTER = "@assets/readium/readium-css/ReadiumCSS-after.css"
+    private val ASSET_PATH_BEFORE = "readium/readium-css/ReadiumCSS-before.css"
+    private val ASSET_PATH_AFTER = "readium/readium-css/ReadiumCSS-after.css"
 
     /**
      * Flow of total pages count for the entire publication.
@@ -77,9 +87,95 @@ internal class EpubPageCalculationManager(
 
             val testResult = wasmPageCalculator.testWasmConnection()
             Log.e("EpubPageCalc", "🧪 WASM 테스트 결과: $testResult")
+
+            // Step 2: Build CSS registry once and register to WASM.
+            try {
+                if (!cssRegistryRegistered) {
+                    val registryJson = buildCssRegistryJson()
+                    val ok = wasmPageCalculator.registerCssRegistry(registryJson)
+                    cssRegistryRegistered = ok
+                    Log.e(
+                        "EpubPageCalc", "📦 CSS 레지스트리 등록 결과: $ok, size=${
+                            try {
+                                JSONObject(registryJson).length()
+                            } catch (_: Throwable) {
+                                -1
+                            }
+                        }"
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.w("EpubPageCalc", "⚠️ CSS 레지스트리 등록 실패: ${t.message}")
+            }
         } else {
             Log.e("EpubPageCalc", "❌ WASM 초기화 실패!")
         }
+    }
+
+    /**
+     * Build a CSS registry JSON: { href -> { baseHref, text } } for all CSS resources in the publication.
+     */
+    private suspend fun buildCssRegistryJson(): String = withContext(Dispatchers.IO) {
+        val registry = JSONObject()
+
+        fun looksLikeCss(href: String?): Boolean {
+            if (href.isNullOrBlank()) return false
+            val lower = href.lowercase()
+            return lower.endsWith(".css")
+        }
+
+        val cssLinks: List<Link> = try {
+            publication.resources.filter { looksLikeCss(it.href?.toString()) }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+
+        for (link in cssLinks) {
+            try {
+                val href = link.href?.toString() ?: continue
+                val resource = publication.get(link) ?: continue
+                val bytes = resource.read().getOrNull() ?: continue
+                val text = try {
+                    bytes.toString(Charsets.UTF_8)
+                } catch (_: Throwable) {
+                    // Fallback; may contain non-UTF8 but acceptable for most CSS
+                    String(bytes)
+                }
+                val baseHref = href.substringBeforeLast('/', missingDelimiterValue = "")
+                    .let { if (it.isNotEmpty()) "$it/" else "" }
+                val obj = JSONObject().apply {
+                    put("baseHref", baseHref)
+                    put("text", text)
+                }
+                registry.put(href, obj)
+            } catch (t: Throwable) {
+                Log.w(
+                    "EpubPageCalc",
+                    "[CSS DEBUG] CSS 레지스트리 항목 생성 실패: ${link.href} -> ${t.message}"
+                )
+            }
+        }
+
+        // Include ReadiumCSS before/after from app assets
+        fun putAssetToRegistry(regKey: String, assetPath: String) {
+            try {
+                val text = context.assets.open(assetPath).bufferedReader().use { it.readText() }
+                val baseHref = assetPath.substringBeforeLast('/', "")
+                    .let { if (it.isNotEmpty()) "$it/" else "" }
+                val obj = JSONObject().apply {
+                    put("baseHref", baseHref)
+                    put("text", text)
+                }
+                registry.put(regKey, obj)
+                Log.d("EpubPageCalc", "[CSS DEBUG] 자산 CSS 등록: $regKey (${text.length} chars)")
+            } catch (t: Throwable) {
+                Log.w("EpubPageCalc", "[CSS DEBUG] 자산 CSS 로드 실패: $assetPath -> ${t.message}")
+            }
+        }
+        putAssetToRegistry(REGKEY_ASSET_BEFORE, ASSET_PATH_BEFORE)
+        putAssetToRegistry(REGKEY_ASSET_AFTER, ASSET_PATH_AFTER)
+
+        registry.toString()
     }
 
     /**
@@ -141,16 +237,6 @@ internal class EpubPageCalculationManager(
 //                } catch (t: Throwable) {
 //                    Log.w("EpubPageCalc", "[디버그] 레이아웃 덤프 실패: ${t.message}")
 //                }
-                // 1단계 1번: 현재 리소스(프래그먼트)의 HTML에서 CSS 경로 추출 (최초 한 번)
-                val cssPaths = extractCssLinksFromCurrentFragment(currentFragment)
-                Log.d("EpubPageCalc", "[CSS DEBUG] 추출된 CSS 경로: $cssPaths")
-
-                // 1단계 2번: CSS 콘텐츠 읽기 및 캐싱
-                try {
-                    cacheCssContents(cssPaths, currentFragment)
-                } catch (t: Throwable) {
-                    Log.w("EpubPageCalc", "[CSS DEBUG] CSS 캐싱 중 오류: ${t.message}")
-                }
 
                 val samplingJson = collectSamplingData(currentFragment)
                 performSamplingBasedCalculation(samplingJson, getFragmentAt)
@@ -184,7 +270,8 @@ internal class EpubPageCalculationManager(
     }
 
     /**
-     * Perform sampling-based page calculation using first loaded resource.
+     * Step 3: For each spine, parse stylesheet hrefs and inline <style> blocks from the HTML,
+     * resolve hrefs against the document href to match registry keys, and use calculatePagesWithRegistry.
      */
     private suspend fun performSamplingBasedCalculation(
         samplingJson: String,
@@ -198,18 +285,30 @@ internal class EpubPageCalculationManager(
         // Process each resource in reading order
         for (link in readingOrder) {
             val resource = publication.get(link)
+            val documentHref = link.href?.toString() ?: ""
             Log.d("EpubPageCalc", "[전체] 리소스 페이지 계산: ${link.href}")
             if (resource != null) {
                 val htmlResult = resource.read()
                 htmlResult.getOrNull()?.let { bytes ->
                     val html = String(bytes)
-                    val cssParts = cssCache.values.toList()
-                    val cssText = cssParts.joinToString("\n\n")
+
+                    // Step 3: Extract stylesheet hrefs and inline <style> from the HTML itself.
+                    val hrefs = extractStylesheetHrefs(html, documentHref)
+                    val inlines = extractInlineStyles(html)
+                    val hrefsJson = JSONArray(hrefs).toString()
+                    val inlineStylesJson = JSONArray(inlines).toString()
+
                     Log.d(
                         "EpubPageCalc",
-                        "[CSS DEBUG] WASM 전달 CSS: parts=${cssParts.size}, length=${cssText.length}"
+                        "[CSS DEBUG] 레지스트리 기반 호출: hrefs=${hrefs.size}, inlineStyles=${inlines.size}"
                     )
-                    val result = wasmPageCalculator.calculatePages(html, cssText, samplingJson)
+
+                    val result = wasmPageCalculator.calculatePagesWithRegistry(
+                        html = html,
+                        hrefsJson = hrefsJson,
+                        inlineStylesJson = inlineStylesJson,
+                        samplingJson = samplingJson
+                    )
                     Log.d(
                         "EpubPageCalc",
                         "[전체] 리소스 결과 result=${result}"
@@ -548,260 +647,52 @@ internal class EpubPageCalculationManager(
         wasmPageCalculator.destroy()
     }
 
-    /**
-     * Debug helper: dump important layout metrics and bottom gap analysis from WebView.
-     */
-    private suspend fun debugDumpLayoutMetrics(fragment: R2EpubPageFragment?) {
-        val webView = fragment?.webView ?: return
-        val result = webView.runJavaScriptSuspend(
-            """
-            (function() {
-                const body = document.body;
-                const html = document.documentElement;
-                const csBody = window.getComputedStyle(body);
-                const csHtml = window.getComputedStyle(html);
-
-                function lastContentChild() {
-                    const kids = Array.from(body.children);
-                    for (let i = kids.length - 1; i >= 0; i--) {
-                        const el = kids[i];
-                        const tag = el.tagName;
-                        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') continue;
-                        return el;
-                    }
-                    return null;
-                }
-
-                const last = lastContentChild();
-                const rectLast = last ? last.getBoundingClientRect() : null;
-                const rectBody = body.getBoundingClientRect();
-                const csLast = last ? window.getComputedStyle(last) : null;
-
-                // Collect all --RS__* variables
-                const rsVars = {};
-                for (let i = 0; i < csHtml.length; i++) {
-                    const prop = csHtml[i];
-                    if (prop.indexOf('--RS__') === 0) {
-                        rsVars[prop] = csHtml.getPropertyValue(prop).trim();
-                    }
-                }
-
-                const data = {
-                    viewport: { innerWidth: window.innerWidth, innerHeight: window.innerHeight },
-                    html: {
-                        marginTop: parseFloat(csHtml.marginTop) || 0,
-                        marginBottom: parseFloat(csHtml.marginBottom) || 0,
-                        paddingTop: parseFloat(csHtml.paddingTop) || 0,
-                        paddingBottom: parseFloat(csHtml.paddingBottom) || 0,
-                        lineHeight: csHtml.lineHeight,
-                        fontSize: csHtml.fontSize
-                    },
-                    body: {
-                        marginTop: parseFloat(csBody.marginTop) || 0,
-                        marginBottom: parseFloat(csBody.marginBottom) || 0,
-                        paddingTop: parseFloat(csBody.paddingTop) || 0,
-                        paddingBottom: parseFloat(csBody.paddingBottom) || 0,
-                        borderTop: parseFloat(csBody.borderTopWidth) || 0,
-                        borderBottom: parseFloat(csBody.borderBottomWidth) || 0,
-                        lineHeight: csBody.lineHeight,
-                        fontSize: csBody.fontSize
-                    },
-                    sizes: {
-                        bodyScrollHeight: body.scrollHeight,
-                        bodyOffsetHeight: body.offsetHeight,
-                        bodyClientHeight: body.clientHeight,
-                        docScrollHeight: Math.max(body.scrollHeight, html.scrollHeight),
-                        rectBodyHeight: rectBody.height
-                    },
-                    last: last ? {
-                        tag: last.tagName.toLowerCase(),
-                        marginBottom: parseFloat(csLast.marginBottom) || 0,
-                        paddingBottom: parseFloat(csLast.paddingBottom) || 0,
-                        rectBottom: rectLast.bottom,
-                        gapToViewportBottom: window.innerHeight - rectLast.bottom
-                    } : null,
-                    rsVars: rsVars
-                };
-
-                return JSON.stringify(data);
-            })();
-            """
-        )
-
-        val json = try {
-            JSONObject(result)
-        } catch (e: Exception) {
-            null
+    /** Resolve a relative href against the EPUB document href to match registry keys. */
+    private fun resolvePublicationHref(documentHref: String, relHref: String): String {
+        val baseDir = documentHref.substringBeforeLast('/', "")
+        // TODO : https://pub/ 이건 어디서 온 url???
+        val baseUri = URI.create("https://pub/" + if (baseDir.isNotEmpty()) "$baseDir/" else "")
+        val resolved = try {
+            baseUri.resolve(relHref)
+        } catch (_: Throwable) {
+            return relHref
         }
-        Log.e("EpubPageCalc", "[디버그] 레이아웃 덤프: ${json ?: result}")
+        var path = resolved.path ?: relHref
+        if (path.startsWith('/')) path = path.substring(1)
+        return path
     }
 
-    /**
-     * Debug helper: dump WebView and ancestor view hierarchy metrics (padding/margin/size, insets).
-     */
-    @Suppress("DEPRECATION")
-    private fun debugDumpViewHierarchy(fragment: R2EpubPageFragment?) {
-        val webView = fragment?.webView ?: return
-        Log.e("EpubPageCalc", "[디버그] ===== View 계층 덤프 시작 =====")
-
-        fun lpInfo(view: android.view.View): String {
-            val lp = view.layoutParams
-            val size = "lp=${lp?.width}x${lp?.height}"
-            val margin = if (lp is android.view.ViewGroup.MarginLayoutParams) {
-                ", margin=[l=${lp.leftMargin}, t=${lp.topMargin}, r=${lp.rightMargin}, b=${lp.bottomMargin}]"
-            } else ""
-            return size + margin
-        }
-
-        fun viewInfo(prefix: String, view: android.view.View) {
-            val cls = view.javaClass.simpleName
-            val pads =
-                "pad=[l=${view.paddingLeft}, t=${view.paddingTop}, r=${view.paddingRight}, b=${view.paddingBottom}]"
-            val dims =
-                "measured=${view.measuredWidth}x${view.measuredHeight}, actual=${view.width}x${view.height}"
-            val rootInsets = view.rootWindowInsets
-            Log.e(
-                "EpubPageCalc",
-                "$prefix$cls: $pads, $dims, ${lpInfo(view)}, insets=${rootInsets}"
-            )
-        }
-
-        // Dump WebView specifics
-        val density = webView.resources.displayMetrics.density
-        val scale = try {
-            webView.scale
-        } catch (t: Throwable) {
-            1.0f
-        }
-        val contentHeightCss = webView.contentHeight // CSS px
-        val contentHeightViewPx = contentHeightCss * scale
-        val contentHeightDevicePx = contentHeightViewPx * density
-        Log.e(
-            "EpubPageCalc",
-            "[디버그] WebView contentHeight: css=${contentHeightCss}, scale=${"%.3f".format(scale)}, " +
-                "viewPx=${"%.1f".format(contentHeightViewPx)}, devicePx≈${
-                    "%.1f".format(
-                        contentHeightDevicePx
-                    )
-                } density=${"%.2f".format(density)}"
-        )
-
-        // Walk up the parent chain (max 8 levels)
-        var v: android.view.View? = webView
-        var depth = 0
-        while (v != null && depth < 8) {
-            viewInfo(prefix = "[디버그] V$depth ", view = v)
-            v = (v.parent as? android.view.View)
-            depth++
-        }
-
-        Log.e("EpubPageCalc", "[디버그] ===== View 계층 덤프 끝 =====")
-    }
-
-    /**
-     * 현재 리소스(프래그먼트)의 HTML에서 <link rel="stylesheet">의 href(EPUB 상대 경로) 리스트 추출
-     * @return List<String>
-     */
-    private suspend fun extractCssLinksFromCurrentFragment(fragment: R2EpubPageFragment?): List<String> {
-        val webView = fragment?.webView ?: return emptyList()
-        val js = (
-            """
-            (function() {
-                try {
-                    var nodes = Array.prototype.slice.call(document.querySelectorAll('link[rel="stylesheet"]'));
-                    var hrefs = nodes.map(function(n){ return n.getAttribute('href') || ''; }).filter(function(h){ return h && h.length > 0; });
-                    // Fallback: also scan inline <style> for @import url(...)
-                    try {
-                        var styleTexts = Array.prototype.slice.call(document.querySelectorAll('style')).map(function(s){ return s.textContent || ''; }).join('\n');
-                        var importHrefs = [];
-                        var re = /@import\s+url\(([^)]+)\)/gi;
-                        var m;
-                        while ((m = re.exec(styleTexts)) !== null) {
-                            var ref = (m[1] || '').replace(/['\"]/g, '').trim();
-                            if (ref) importHrefs.push(ref);
-                        }
-                        hrefs = hrefs.concat(importHrefs);
-                    } catch(e2) { /* ignore */ }
-                    return hrefs;
-                } catch (e) {
-                    return [];
-                }
-            })();
-            """
-            ).trim()
-        return try {
-            val raw = webView.runJavaScriptSuspend(js)
-            val arr = JSONArray(raw)
-            buildList(arr.length()) {
-                for (i in 0 until arr.length()) {
-                    val href = arr.optString(i)?.trim()
-                    if (!href.isNullOrEmpty()) add(href)
-                }
-            }.distinct()
-        } catch (t: Throwable) {
-            Log.w("EpubPageCalc", "[CSS DEBUG] CSS 추출 파싱 실패: ${t.message}")
-            emptyList()
-        }
-    }
-
-    // CSS 콘텐츠 캐시: key = 원본 href, value = css 텍스트
-    private val cssCache: MutableMap<String, String> = mutableMapOf()
-
-    /**
-     * CSS 경로 리스트를 받아 캐시에 CSS 텍스트를 저장합니다. 이미 캐시에 있으면 재사용합니다.
-     */
-    private suspend fun cacheCssContents(paths: List<String>, fragment: R2EpubPageFragment) {
-        for (path in paths.distinct()) {
-            if (cssCache.containsKey(path)) {
-                Log.d("EpubPageCalc", "[CSS DEBUG] 캐시 히트: $path (length=${cssCache[path]?.length})")
-                continue
-            }
-
-            // WebViewServer를 통해 모든 EPUB/asset 리소스를 제공하므로,
-            // 현재 리소스의 document.baseURI를 기준으로 XHR로 가져온다.
-            val escaped = path.replace("\\", "\\\\").replace("\"", "\\\"")
-            val js = (
-                """
-                (function(){
-                  try {
-                    var url = (new URL("$escaped", document.baseURI)).href;
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', url, false);
-                    xhr.send(null);
-                    if (xhr.status >= 200 && xhr.status < 400) {
-                      return {href:url, text:xhr.responseText};
-                    } else {
-                      return {href:url, text:''};
-                    }
-                  } catch (e) {
-                    return {href:"$escaped", text:''};
-                  }
-                })();
-                """
-                ).trim()
-
-            runCatching {
-                val json = fragment.webView?.runJavaScriptSuspend(js) ?: "{}"
-                val obj = try {
-                    JSONObject(json)
-                } catch (_: Throwable) {
-                    // 일부 WebView 구현에서 문자열로 감싸져 반환될 수 있음
-                    val unwrapped = json.trim().removeSurrounding("\"")
-                    JSONObject(unwrapped)
-                }
-                val text = obj.optString("text", "")
-                if (text.isNotEmpty()) {
-                    cssCache[path] = text
-                    Log.d(
-                        "EpubPageCalc",
-                        "[CSS DEBUG] 캐시 저장(XHR): ${obj.optString("href")} (length=${text.length})"
-                    )
-                } else {
-                    Log.w("EpubPageCalc", "[CSS DEBUG] XHR 결과 비어있음: $path")
-                }
-            }.onFailure {
-                Log.w("EpubPageCalc", "[CSS DEBUG] XHR 읽기 실패: $path -> ${it.message}")
+    /** Extract <link rel="stylesheet" href="..."> hrefs in document order and resolve them. */
+    private fun extractStylesheetHrefs(html: String, documentHref: String): List<String> {
+        val result = mutableListOf<String>()
+        val regex = Regex("<link\\s+[^>]*rel=\\\"?stylesheet\\\"?[^>]*>", RegexOption.IGNORE_CASE)
+        val hrefRegex = Regex("href=\\\"([^\\\"]+)\\\"|href='([^']+)'", RegexOption.IGNORE_CASE)
+        regex.findAll(html).forEach { m ->
+            val tag = m.value
+            val hrefMatch = hrefRegex.find(tag)
+            val rawHref = hrefMatch?.groups?.get(1)?.value ?: hrefMatch?.groups?.get(2)?.value
+            if (!rawHref.isNullOrBlank()) {
+                val resolved = resolvePublicationHref(documentHref, rawHref)
+                Log.d("EpubPageCalc", "[CSS DEBUG] 스타일시트 추출: $resolved")
+                result.add(resolved)
             }
         }
+        // Prepend before.css and append after.css (assets) using synthetic keys
+        val finalList = ArrayList<String>(result.size + 2)
+        finalList.add(REGKEY_ASSET_BEFORE)
+        finalList.addAll(result)
+        finalList.add(REGKEY_ASSET_AFTER)
+        return finalList
+    }
+
+    /** Extract inline <style>...</style> blocks in document order. */
+    private fun extractInlineStyles(html: String): List<String> {
+        val result = mutableListOf<String>()
+        val regex = Regex("<style[^>]*>([\\s\\S]*?)</style>", setOf(RegexOption.IGNORE_CASE))
+        regex.findAll(html).forEach { m ->
+            val content = m.groups[1]?.value ?: ""
+            if (content.isNotBlank()) result.add(content)
+        }
+        return result
     }
 }
