@@ -10,6 +10,7 @@ import android.content.Context
 import android.util.Log
 import android.webkit.ValueCallback
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -592,9 +593,9 @@ internal class DefaultWasmPageCalculator(
                     null
                 )
 
-                // 초기화 완료 대기 (최대 15초로 증가)
+                // 초기화 완료 대기 (최대 15초)
                 var attempts = 0
-                val maxAttempts = 60 // 15초 (250ms * 60)
+                val maxAttempts = 60 // 250ms * 60 = 15s
 
                 fun checkInitialization() {
                     Log.d("WasmPageCalculator", "🔍 초기화 상태 체크 중... (attempt: $attempts)")
@@ -603,7 +604,6 @@ internal class DefaultWasmPageCalculator(
                         when {
                             result?.contains("true") == true -> {
                                 Log.d("WasmPageCalculator", "✅ WASM 모듈 초기화 완료")
-                                // 테스트 함수도 실행해보기
                                 webView.evaluateJavascript("testWasm()") { testResult ->
                                     Log.d("WasmPageCalculator", "🧪 WASM 테스트 결과: $testResult")
                                 }
@@ -629,7 +629,6 @@ internal class DefaultWasmPageCalculator(
                                     "WasmPageCalculator",
                                     "⏳ 대기 중... (attempt: $attempts/$maxAttempts)"
                                 )
-                                // Handler 사용하여 다음 체크 스케줄링
                                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                                     checkInitialization()
                                 }, 250)
@@ -638,11 +637,14 @@ internal class DefaultWasmPageCalculator(
                     }
                 }
 
-                Log.d("WasmPageCalculator", "🕒 1초 후 초기화 상태 체크 시작...")
-                // 첫 번째 체크를 Handler로 스케줄링
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    checkInitialization()
-                }, 1000) // TODO : 1초 안해도 되지않나??
+                // 페이지 로드 완료 시 즉시 초기화 체크 시작
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        super.onPageFinished(view, url)
+                        Log.d("WasmPageCalculator", "📄 WASM 호스트 페이지 로드 완료, 초기화 상태 체크 시작")
+                        checkInitialization()
+                    }
+                }
             } catch (e: Exception) {
                 Log.e("WasmPageCalculator", "WASM 모듈 로드 실패", e)
                 continuation.resume(false)
