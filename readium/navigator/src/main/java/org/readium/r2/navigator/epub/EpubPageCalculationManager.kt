@@ -8,7 +8,10 @@ package org.readium.r2.navigator.epub
 
 import android.content.Context
 import android.util.Log
+import android.graphics.BitmapFactory
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
@@ -33,6 +36,9 @@ internal class EpubPageCalculationManager(
     }
 
     private val _totalPagesFlow = MutableStateFlow<Int?>(null)
+
+    // Cache of image dimensions for all EPUB-internal images. Built once, reused.
+    private var imageDimensionsCache: JSONObject? = null
 
     /**
      * Flow of total pages count for the entire publication.
@@ -242,6 +248,59 @@ internal class EpubPageCalculationManager(
     }
 
     /**
+     * Collect a map of image href -> {width,height} for all EPUB-internal raster images.
+     * This is calculated once and cached. SVG is skipped for now (intrinsic size ambiguous).
+     */
+    private suspend fun collectAllImageDimensions(): JSONObject = withContext(Dispatchers.IO) {
+        imageDimensionsCache?.let { return@withContext it }
+
+        val result = JSONObject()
+
+        fun looksLikeRasterImage(href: String?): Boolean {
+            if (href.isNullOrBlank()) return false
+            val lower = href.lowercase()
+            return lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+                lower.endsWith(".png") || lower.endsWith(".gif") ||
+                lower.endsWith(".webp") || lower.endsWith(".bmp")
+        }
+
+        val candidates: List<Link> = try {
+            // publication.resources usually contains non-spine assets (images, css, fonts, etc.)
+            val res = try {
+                publication.resources
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            res.filter { looksLikeRasterImage(it.href.toString()) }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+
+        for (link in candidates) {
+            try {
+                val resource = publication.get(link) ?: continue
+                val bytes = resource.read().getOrNull() ?: continue
+                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                val w = opts.outWidth
+                val h = opts.outHeight
+                if (w > 0 && h > 0) {
+                    val dim = JSONObject().apply {
+                        put("width", w)
+                        put("height", h)
+                    }
+                    result.put(link.href.toString(), dim)
+                }
+            } catch (t: Throwable) {
+                Log.w("EpubPageCalc", "[IMG] 치수 추출 실패: ${link.href} -> ${t.message}")
+            }
+        }
+
+        imageDimensionsCache = result
+        return@withContext result
+    }
+
+    /**
      * Collect sampling data from a loaded WebView fragment.
      */
     private suspend fun collectSamplingData(fragment: R2EpubPageFragment): String {
@@ -395,9 +454,21 @@ internal class EpubPageCalculationManager(
 
         // JavaScript가 JSON.stringify()로 이미 문자열로 반환한 결과를 다시 문자열로 감쌌으므로 따옴표 제거
         val cleanedJson = metricsJson.trim().removeSurrounding("\"").replace("\\\"", "\"")
+        val obj = try {
+            JSONObject(cleanedJson)
+        } catch (e: Exception) {
+            JSONObject()
+        }
+        try {
+            val dims = collectAllImageDimensions()
+            obj.put("imageDimensions", dims)
+            Log.d("EpubPageCalc", "[샘플링] 이미지 치수 맵 포함: count=${dims.length()}")
+        } catch (t: Throwable) {
+            Log.w("EpubPageCalc", "[샘플링] 이미지 치수 수집 실패: ${t.message}")
+        }
         Log.d("EpubPageCalc", "[샘플링] WASM 호환 샘플링 데이터 수집 완료")
 
-        return cleanedJson
+        return obj.toString()
     }
 
     /**

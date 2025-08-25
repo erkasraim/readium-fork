@@ -11,95 +11,6 @@ fn parse_css_px(value: &str) -> f64 {
     no_px.parse::<f64>().unwrap_or(0.0)
 }
 
-/// 컨테이너의 첫/마지막 요소의 바깥 마진(px)을 계산
-/// 웹뷰의 body 가장자리에서 발생하는 마진 병합을 보정하기 위해 사용
-fn compute_outer_margins(document: &Document, window: &Window, container: &Element) -> (f64, f64) {
-    // 첫 요소
-    let mut first_top_margin = 0.0;
-    let mut current = container.first_element_child();
-    let mut depth_guard = 0;
-    while let Some(elem) = current {
-        if depth_guard > 32 { break; } // 안전 가드
-        depth_guard += 1;
-        if let Ok(Some(style)) = window.get_computed_style(&elem) {
-            let mt = style.get_property_value("margin-top").unwrap_or_default();
-            let display = style.get_property_value("display").unwrap_or_default();
-            let position = style.get_property_value("position").unwrap_or_default();
-            // in-flow block으로 간주되는 경우만 카운트
-            if display != "none" && position != "absolute" && position != "fixed" {
-                let mt_px = parse_css_px(&mt);
-                if mt_px > 0.0 || elem.first_element_child().is_none() {
-                    first_top_margin = mt_px;
-                    break;
-                }
-            }
-        }
-        current = elem.first_element_child();
-    }
-
-    // 마지막 요소
-    let mut last_bottom_margin = 0.0;
-    let mut current_last = container.last_element_child();
-    let mut depth_guard_last = 0;
-    while let Some(elem) = current_last {
-        if depth_guard_last > 32 { break; }
-        depth_guard_last += 1;
-        if let Ok(Some(style)) = window.get_computed_style(&elem) {
-            let mb = style.get_property_value("margin-bottom").unwrap_or_default();
-            let display = style.get_property_value("display").unwrap_or_default();
-            let position = style.get_property_value("position").unwrap_or_default();
-            if display != "none" && position != "absolute" && position != "fixed" {
-                let mb_px = parse_css_px(&mb);
-                if mb_px > 0.0 || elem.last_element_child().is_none() {
-                    last_bottom_margin = mb_px;
-                    break;
-                }
-            }
-        }
-        current_last = elem.last_element_child();
-    }
-
-    (first_top_margin, last_bottom_margin)
-}
-
-/// 첫/마지막 실제 렌더 박스를 이용해 여분 갭(px)을 계산
-/// - top_gap = first_content_rect.top - container_rect.top
-/// - bottom_gap = container_rect.bottom - last_content_rect.bottom
-fn compute_outer_gaps_by_geometry(window: &Window, container: &Element) -> (f64, f64) {
-    let container_rect = container.get_bounding_client_rect();
-    let mut first_rect_top: Option<f64> = None;
-    let mut last_rect_bottom: Option<f64> = None;
-
-    // 후손 모두 탐색해 in-flow 박스의 첫/마지막을 찾음
-    if let Ok(node_list) = container.query_selector_all(":scope *") {
-        let length = node_list.length();
-        for i in 0..length {
-            if let Some(node) = node_list.item(i) {
-                if let Some(elem) = node.dyn_ref::<Element>() {
-                    if let Ok(Some(style)) = window.get_computed_style(elem) {
-                        let display = style.get_property_value("display").unwrap_or_default();
-                        let position = style.get_property_value("position").unwrap_or_default();
-                        if display == "none" || position == "absolute" || position == "fixed" {
-                            continue;
-                        }
-                        let rect = elem.get_bounding_client_rect();
-                        if rect.width() > 0.0 && rect.height() > 0.0 {
-                            if first_rect_top.is_none() {
-                                first_rect_top = Some(rect.top());
-                            }
-                            last_rect_bottom = Some(rect.bottom());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let top_gap = first_rect_top.map(|t| (t - container_rect.top()).max(0.0)).unwrap_or(0.0);
-    let bottom_gap = last_rect_bottom.map(|b| (container_rect.bottom() - b).max(0.0)).unwrap_or(0.0);
-    (top_gap, bottom_gap)
-}
-
 // (removed) string_to_i32: unused
 // (removed) flexible_f32: only used by removed FontMetrics
 
@@ -448,6 +359,9 @@ pub struct SamplingData {
     pub document_dir: Option<String>,
     #[serde(rename = "documentWritingMode")]
     pub document_writing_mode: Option<String>,
+    // 이미지 치수 맵 (키: src 또는 경로, 값: width/height)
+    #[serde(rename = "imageDimensions")]
+    pub image_dimensions: Option<HashMap<String, ImageDimension>>,
 }
 
 // (removed) FontMetrics: no longer needed
@@ -490,6 +404,13 @@ pub struct BodyStyle {
     #[serde(rename = "paddingLeft")]
     #[serde(deserialize_with = "opt_string_to_i32")]
     pub padding_left: i32,
+}
+
+/// EPUB 내 이미지의 고정 치수
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImageDimension {
+    pub width: i32,
+    pub height: i32,
 }
 
 /// 페이지 계산 결과 구조체
@@ -637,14 +558,14 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
     // wrapper를 오프스크린 고정 + 뷰포트 폭 고정
     // 모드 판별 (wrapper 레이아웃 결정에 사용)
     let user_view_mode = sampling_data.css_variables.vars.get("--USER__view").cloned();
-    let is_scroll_mode_for_wrapper = user_view_mode
+    let detected_is_scroll_mode = user_view_mode
         .as_ref()
         .map(|v| v.contains("readium-scroll-on"))
         .or_else(|| sampling_data.root_style_attr.as_ref().map(|s| s.contains("readium-scroll-on")))
         .unwrap_or(false);
 
     // 기본 레이아웃 스타일: 모드별 wrapper 배치
-    if is_scroll_mode_for_wrapper {
+    if detected_is_scroll_mode {
         // scroll 모드: 오프스크린 고정 + 뷰포트 폭 고정 (기존 동작)
         wrapper_style.set_css_text(&format!(
             "position:fixed !important; \
@@ -675,48 +596,16 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
     }
 
     // 기본값 설정 (body_style이 없을 경우 대비)
-    let mut actual_padding_left = 0;
-    let mut actual_padding_right = 0;
-    let mut actual_padding_top = 0;
-    let mut actual_padding_bottom = 0;
-    let mut actual_margin_top = 0;
-    let mut actual_margin_bottom = 0;
-    let mut pure_content_width = sampling_data.viewport_width;
-    let mut total_width_including_padding = pure_content_width;
-    
-    if let Some(body_style) = &sampling_data.body_style {
-        actual_padding_left = body_style.padding_left;
-        actual_padding_right = body_style.padding_right;
-        actual_padding_top = body_style.padding_top;
-        actual_padding_bottom = body_style.padding_bottom;
-        actual_margin_top = body_style.margin_top;
-        actual_margin_bottom = body_style.margin_bottom;
-        
-        total_width_including_padding = body_style.content_width;
-        
-        console_log!("📐 너비 분석:");
-        console_log!("  - contentWidth (WebView 측정): {}px", total_width_including_padding);
-        console_log!("  - contentHeight (WebView 측정): {}px", body_style.content_height);
-        console_log!("  - paddingLeft: {}px", actual_padding_left);
-        console_log!("  - paddingRight: {}px", actual_padding_right);
-        console_log!("  - 총 좌우 패딩: {}px", actual_padding_left + actual_padding_right);
-        
-        let total_horizontal_padding = actual_padding_left + actual_padding_right;
-        pure_content_width = if total_horizontal_padding > 0 {
-            total_width_including_padding - total_horizontal_padding
-        } else {
-            total_width_including_padding
-        };
-        
-        console_log!("📐 패딩 중복 방지 계산:");
-        console_log!("  - 전체 너비 (padding 포함): {}px", total_width_including_padding);
-        console_log!("  - 총 좌우 패딩: {}px", total_horizontal_padding);
-        console_log!("  - 순수 콘텐츠 너비: {}px", pure_content_width);
-        console_log!("📐 최종 적용 너비(콘텐츠 기준): {}px (폭/박스모델은 베이스라인 측정 후 적용)", pure_content_width);
-    }
-
-    // 외부 CSS 제공됨 → 인라인 타이포그래피 적용 생략
-    console_log!("🎨 외부 CSS 제공됨 → 폰트/라인높이 인라인 적용 생략");
+    let (
+        actual_padding_left,
+        actual_padding_right,
+        actual_padding_top,
+        actual_padding_bottom,
+        actual_margin_top,
+        actual_margin_bottom,
+        total_width_including_padding,
+        pure_content_width,
+    ) = debug_compute_and_log_body_widths(&sampling_data);
     
     // 스타일 요소 생성 및 외부 CSS만 주입
     let para_style = document.create_element("style").unwrap();
@@ -769,13 +658,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
         
         // 컨테이너 스코프에서 타이포그래피/바디 레이아웃 보정 규칙 추가
         if let Some(sheet_el) = para_style.dyn_ref::<HtmlElement>() {
-            // 모드 판별: 우선 --USER__view, 없으면 rootStyleAttr 사용
-            let user_view = sampling_data.css_variables.vars.get("--USER__view").cloned();
-            let is_scroll_mode = user_view
-                .as_ref()
-                .map(|v| v.contains("readium-scroll-on"))
-                .or_else(|| sampling_data.root_style_attr.as_ref().map(|s| s.contains("readium-scroll-on")))
-                .unwrap_or(false);
+            let is_scroll_mode = detected_is_scroll_mode;
             console_log!("🧭 감지된 모드: {}", if is_scroll_mode { "scroll" } else { "paged" });
 
             if is_scroll_mode {
@@ -884,7 +767,65 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
     }
 }
 
-// (removed) calculate_pages_internal: fallback path no longer supported
+/// 📐 body 폭/패딩 디버그 로깅 및 순수 콘텐츠 너비 계산
+/// 반환: (padL, padR, padT, padB, marT, marB, totalWidthIncludingPadding, pureContentWidth)
+fn debug_compute_and_log_body_widths(
+    sampling_data: &SamplingData,
+) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
+    let mut actual_padding_left = 0;
+    let mut actual_padding_right = 0;
+    let mut actual_padding_top = 0;
+    let mut actual_padding_bottom = 0;
+    let mut actual_margin_top = 0;
+    let mut actual_margin_bottom = 0;
+    let mut pure_content_width = sampling_data.viewport_width;
+    let mut total_width_including_padding = pure_content_width;
+
+    if let Some(body_style) = &sampling_data.body_style {
+        actual_padding_left = body_style.padding_left;
+        actual_padding_right = body_style.padding_right;
+        actual_padding_top = body_style.padding_top;
+        actual_padding_bottom = body_style.padding_bottom;
+        actual_margin_top = body_style.margin_top;
+        actual_margin_bottom = body_style.margin_bottom;
+        
+        total_width_including_padding = body_style.content_width;
+        
+        console_log!("📐 너비 분석:");
+        console_log!("  - contentWidth (WebView 측정): {}px", total_width_including_padding);
+        console_log!("  - contentHeight (WebView 측정): {}px", body_style.content_height);
+        console_log!("  - paddingLeft: {}px", actual_padding_left);
+        console_log!("  - paddingRight: {}px", actual_padding_right);
+        console_log!("  - 총 좌우 패딩: {}px", actual_padding_left + actual_padding_right);
+        
+        let total_horizontal_padding = actual_padding_left + actual_padding_right;
+        pure_content_width = if total_horizontal_padding > 0 {
+            total_width_including_padding - total_horizontal_padding
+        } else {
+            total_width_including_padding
+        };
+        
+        console_log!("📐 패딩 중복 방지 계산:");
+        console_log!("  - 전체 너비 (padding 포함): {}px", total_width_including_padding);
+        console_log!("  - 총 좌우 패딩: {}px", total_horizontal_padding);
+        console_log!("  - 순수 콘텐츠 너비: {}px", pure_content_width);
+        console_log!(
+            "📐 최종 적용 너비(콘텐츠 기준): {}px (폭/박스모델은 베이스라인 측정 후 적용)",
+            pure_content_width
+        );
+    }
+
+    (
+        actual_padding_left,
+        actual_padding_right,
+        actual_padding_top,
+        actual_padding_bottom,
+        actual_margin_top,
+        actual_margin_bottom,
+        total_width_including_padding,
+        pure_content_width,
+    )
+}
 
 /// HTML 내용을 분석하여 마진 기여분을 계산
 fn analyze_html_content(document: &Document, sampling_data: &SamplingData) {
