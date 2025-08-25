@@ -21,7 +21,8 @@ import kotlin.coroutines.resume
  */
 public data class WasmCalculationResult(
     val totalPages: Int,
-    val status: Status
+    val status: Status,
+    val measuredHeight: Double = 0.0
 ) {
     public enum class Status {
         SUCCESS,
@@ -134,6 +135,9 @@ internal class DefaultWasmPageCalculator(
     private var wasmWebView: WebView? = null
     private var wasmJsCode: String? = null
 
+    // Toggle for WASM internal debug logs
+    var enableDebugLogs: Boolean = false
+
     override suspend fun initialize(): Boolean = withContext(Dispatchers.Main) {
         try {
             Log.d("WasmPageCalculator", "🦀 WASM 모듈 초기화 시작...")
@@ -193,7 +197,8 @@ internal class DefaultWasmPageCalculator(
             Log.w("WasmPageCalculator", "⚠️ WASM 미초기화, fallback 사용")
             return@withContext WasmCalculationResult(
                 totalPages = estimatePages(html, samplingJson),
-                status = WasmCalculationResult.Status.FALLBACK_NEEDED
+                status = WasmCalculationResult.Status.FALLBACK_NEEDED,
+                measuredHeight = 0.0
             )
         }
 
@@ -207,26 +212,30 @@ internal class DefaultWasmPageCalculator(
                 val resultJson = JSONObject(result)
                 val totalPages = resultJson.optInt("totalPages", 1)
                 val status = resultJson.optString("status", "ERROR")
+                val measuredHeight = resultJson.optDouble("measured_height", 0.0)
 
                 Log.d("WasmPageCalculator", "✅ WASM 계산 완료: $totalPages pages")
 
                 WasmCalculationResult(
                     totalPages = totalPages,
                     status = if (status == "SUCCESS") WasmCalculationResult.Status.SUCCESS
-                    else WasmCalculationResult.Status.ERROR
+                    else WasmCalculationResult.Status.ERROR,
+                    measuredHeight = measuredHeight
                 )
             } else {
                 Log.w("WasmPageCalculator", "⚠️ WASM 계산 실패, fallback 사용")
                 WasmCalculationResult(
                     totalPages = estimatePages(html, samplingJson),
-                    status = WasmCalculationResult.Status.FALLBACK_NEEDED
+                    status = WasmCalculationResult.Status.FALLBACK_NEEDED,
+                    measuredHeight = 0.0
                 )
             }
         } catch (e: Exception) {
             Log.e("WasmPageCalculator", "❌ WASM 계산 중 오류, fallback 사용", e)
             WasmCalculationResult(
                 totalPages = estimatePages(html, samplingJson),
-                status = WasmCalculationResult.Status.FALLBACK_NEEDED
+                status = WasmCalculationResult.Status.FALLBACK_NEEDED,
+                measuredHeight = 0.0
             )
         }
     }
@@ -411,26 +420,27 @@ internal class DefaultWasmPageCalculator(
                             }
 
                             // 페이지 계산 함수 (간단 모듈 참조, ES6 import 없음)
-                            window.calculatePagesWasm = function(html, cssText, samplingDataJson) {
+                            window.calculatePagesWasm = function(html, cssText, samplingDataJson, debugLogging) {
                                 try {
                                     if (!wasmInitialized) {
                                         throw new Error('WASM 모듈이 초기화되지 않음');
                                     }
 
-                                    console.log('🦀 WASM 페이지 계산 시작...');
-                                    console.log('📄 HTML 길이:', html.length);
-                                    console.log('🎨 CSS 길이:', (cssText || '').length);
-                                    console.log('📊 샘플링 데이터:', samplingDataJson);
+                                    if (debugLogging) console.log('🦀 WASM 페이지 계산 시작...');
+                                    if (debugLogging) console.log('📄 HTML 길이:', html.length);
+                                    if (debugLogging) console.log('🎨 CSS 길이:', (cssText || '').length);
+                                    if (debugLogging) console.log('📊 샘플링 데이터:', samplingDataJson);
 
-                                    const result = window.calculate_pages_with_css(html, cssText || '', samplingDataJson);
+                                    const result = window.calculate_pages_with_css(html, cssText || '', samplingDataJson, !!debugLogging);
                                         
-                                    console.log('✅ WASM 페이지 계산 완료:', result);
+                                    if (debugLogging) console.log('✅ WASM 페이지 계산 완료:', result);
 
                                     return result;
                                 } catch (error) {
-                                    console.error('❌ WASM 페이지 계산 실패:', error);
+                                    if (debugLogging) console.error('❌ WASM 페이지 계산 실패:', error);
                                     return JSON.stringify({
                                         totalPages: 1,
+                                        measured_height: 0,
                                         status: 'ERROR'
                                     });
                                 }
@@ -536,7 +546,7 @@ internal class DefaultWasmPageCalculator(
             val htmlJs = JSONObject.quote(html)
             val cssJs = JSONObject.quote(cssText)
             val samplingJs = JSONObject.quote(samplingJson)
-            val jsCode = "calculatePagesWasm($htmlJs, $cssJs, $samplingJs)"
+            val jsCode = "calculatePagesWasm($htmlJs, $cssJs, $samplingJs, ${if (enableDebugLogs) "true" else "false"})"
 
             webView.evaluateJavascript(jsCode) { result ->
                 if (result != null && result != "null") {

@@ -3,6 +3,17 @@ use web_sys::*;
 use serde::{Deserialize, Serialize, Deserializer};
 use std::collections::HashMap;
 
+/// Global debug logging flag (thread-local for WASM)
+thread_local! { static DEBUG_LOGS: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+
+fn is_debug_logging_enabled() -> bool {
+    DEBUG_LOGS.with(|c| c.get())
+}
+
+fn set_debug_logging(enabled: bool) {
+    DEBUG_LOGS.with(|c| c.set(enabled));
+}
+
 /// CSS 길이 문자열을 f64(px)로 파싱 (예: "12px" → 12.0)
 fn parse_css_px(value: &str) -> f64 {
     let trimmed = value.trim();
@@ -46,7 +57,7 @@ extern "C" {
 }
 
 macro_rules! console_log {
-    ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
+    ($($t:tt)*) => ({ if crate::is_debug_logging_enabled() { log(&format_args!($($t)*).to_string()) } })
 }
 
 /// 고급 타이포/렌더링 설정 및 폭 지표를 로깅
@@ -119,10 +130,6 @@ fn debug_log_advanced_layout(window: &Window, document: &Document, container: &E
             );
         }
     }
-}
-
-macro_rules! console_log {
-    ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
 /// 주입된 CSS가 실제로 적용되었는지 확인하기 위한 디버그 로거
@@ -418,20 +425,25 @@ pub struct ImageDimension {
 pub struct PageCalculationResult {
     #[serde(rename = "totalPages")]
     pub total_pages: i32,
+    #[serde(rename = "measured_height")]
+    pub measured_height: f64,
     pub status: String,
 }
 
 /// WASM에서 호출될 메인 함수 - 페이지 수 계산
 #[wasm_bindgen]
 pub fn calculate_pages(html: &str, sampling_data_json: &str) -> String {
+    // Default: debug logs off for legacy entry point
+    set_debug_logging(false);
     console_log!("🦀 WASM calculate_pages 호출됨");
     // Backward compatibility: no external CSS provided
-    calculate_pages_with_css(html, "", sampling_data_json)
+    calculate_pages_with_css(html, "", sampling_data_json, false)
 }
 
 /// WASM에서 호출될 메인 함수 - 페이지 수 계산 (외부 CSS 포함)
 #[wasm_bindgen]
-pub fn calculate_pages_with_css(html: &str, css_text: &str, sampling_data_json: &str) -> String {
+pub fn calculate_pages_with_css(html: &str, css_text: &str, sampling_data_json: &str, debug_logging: bool) -> String {
+    set_debug_logging(debug_logging);
     console_log!("🦀 WASM calculate_pages_with_css 호출됨");
     console_log!("HTML 길이: {} chars", html.len());
     console_log!("샘플링 데이터: {}", sampling_data_json);
@@ -444,6 +456,7 @@ pub fn calculate_pages_with_css(html: &str, css_text: &str, sampling_data_json: 
             console_log!("❌ JSON 파싱 실패: {}", e);
             let error_result = PageCalculationResult {
                 total_pages: 0,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
             return serde_json::to_string(&error_result).unwrap_or_default();
@@ -469,6 +482,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             console_log!("❌ Window 객체를 찾을 수 없음");
             return PageCalculationResult {
                 total_pages: 1,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
         }
@@ -480,6 +494,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             console_log!("❌ Document 객체를 찾을 수 없음");
             return PageCalculationResult {
                 total_pages: 1,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
         }
@@ -492,6 +507,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             console_log!("❌ 컨테이너 엘리먼트 생성 실패");
             return PageCalculationResult {
                 total_pages: 1,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
         }
@@ -504,6 +520,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             console_log!("❌ 래퍼 엘리먼트 생성 실패");
             return PageCalculationResult {
                 total_pages: 1,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
         }
@@ -628,6 +645,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             console_log!("❌ 래퍼에 컨테이너 추가 실패");
             return PageCalculationResult {
                 total_pages: 1,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
         }
@@ -635,9 +653,17 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
             console_log!("❌ DOM 추가 실패");
             return PageCalculationResult {
                 total_pages: 1,
+                measured_height: 0.0,
                 status: "ERROR".to_string(),
             };
         }
+
+        analyze_html_content(&document, &sampling_data);
+
+        // EPUB 사전 치수 맵으로 미디어 자리 예약 (디코딩 대기 없이 레이아웃 반영)
+        apply_media_placeholders(&container, &sampling_data, pure_content_width as f64);
+
+        transform_imgs_to_placeholders(&window, &document, &container, &sampling_data, pure_content_width as f64, detected_is_scroll_mode);
 
         // A) 베이스라인 측정: 레이아웃에 영향이 큰 속성 적용 전
         console_log!("📏 === 높이 측정 분석 시작 ===");
@@ -750,11 +776,12 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
 
         if page_height > 0.0 {
             let total_pages = ((measured_height as f64) / page_height).ceil() as i32;
-            PageCalculationResult { total_pages: total_pages.max(1), status: "SUCCESS".to_string() }
+            PageCalculationResult { total_pages: total_pages.max(1), measured_height, status: "SUCCESS".to_string() }
         } else {
             console_log!("⚠️ 페이지 높이가 0 - 기본값 1 반환");
             PageCalculationResult {
                 total_pages: 1,
+                measured_height,
                 status: "SUCCESS".to_string(),
             }
         }
@@ -762,6 +789,7 @@ fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: 
         console_log!("❌ Document body를 찾을 수 없음");
         PageCalculationResult {
             total_pages: 1,
+            measured_height: 0.0,
             status: "ERROR".to_string(),
         }
     }
@@ -971,4 +999,254 @@ pub fn test_wasm_connection() -> String {
     "🦀 WASM 모듈이 정상적으로 연결되었습니다!".to_string()
 }
 
-// (removed) tests module: referenced removed fields/types; keep code lean
+// 경로/URL 표준화: 쿼리/해시 제거, 스킴/호스트 제거, 선행 '/' 제거
+fn normalize_urlish_path(input: &str) -> String {
+    if input.is_empty() { return String::new(); }
+    let mut s = input;
+    let cut = s.find(|c| c == '?' || c == '#').unwrap_or(s.len());
+    s = &s[..cut];
+    if let Some(idx) = s.find("://") {
+        let after = &s[idx + 3..];
+        if let Some(sl) = after.find('/') {
+            s = &after[sl + 1..];
+        } else {
+            s = "";
+        }
+    }
+    if s.starts_with('/') { s = &s[1..]; }
+    s.to_string()
+}
+
+fn filename_from_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn find_image_dimension_for_src<'a>(raw_src: &str, abs_src: &str, map: &'a HashMap<String, ImageDimension>) -> Option<&'a ImageDimension> {
+    // 1) 절대 URL 완전 일치
+    if !abs_src.is_empty() {
+        if let Some(dim) = map.get(abs_src) { return Some(dim); }
+    }
+    // 2) 원본 속성값(raw) 완전 일치
+    if !raw_src.is_empty() {
+        if let Some(dim) = map.get(raw_src) { return Some(dim); }
+    }
+    // 3) 경로만 비교 (스킴/호스트/쿼리 제거)
+    let raw_path = normalize_urlish_path(raw_src);
+    let abs_path = normalize_urlish_path(abs_src);
+    if !raw_path.is_empty() {
+        if let Some(dim) = map.get(&raw_path) { return Some(dim); }
+    }
+    if !abs_path.is_empty() {
+        if let Some(dim) = map.get(&abs_path) { return Some(dim); }
+    }
+    // 4) 파일명만 비교 (보수적 fallback)
+    let raw_file = filename_from_path(&raw_path);
+    let abs_file = filename_from_path(&abs_path);
+    for (k, v) in map.iter() {
+        let k_path = normalize_urlish_path(k);
+        let k_file = filename_from_path(&k_path);
+        if (!raw_file.is_empty() && k_file == raw_file) || (!abs_file.is_empty() && k_file == abs_file) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// --RS__maxMediaHeight 값을 파싱하여 px로 반환. 기본값 95vh.
+fn compute_max_media_height_px(sampling_data: &SamplingData) -> f64 {
+    let vh = sampling_data.viewport_height.max(0) as f64;
+    let default_px = 0.95_f64 * vh;
+    let raw = sampling_data
+        .css_variables
+        .vars
+        .get("--RS__maxMediaHeight")
+        .map(|s| s.trim().to_string());
+    if let Some(value) = raw {
+        let v = value.as_str();
+        if v.ends_with("vh") {
+            let num = v.trim_end_matches("vh").trim();
+            if let Ok(n) = num.parse::<f64>() {
+                return (n / 100.0) * vh;
+            }
+        } else if v.ends_with("px") {
+            let num = v.trim_end_matches("px").trim();
+            if let Ok(n) = num.parse::<f64>() {
+                return n.max(0.0);
+            }
+        } else if let Ok(n) = v.parse::<f64>() {
+            return n.max(0.0);
+        }
+    }
+    default_px
+}
+
+/// 이미지에 width/height 속성을 주입하여 레이아웃 상 높이 예약
+fn apply_image_dimensions_to_imgs(container: &Element, image_dims: &HashMap<String, ImageDimension>, content_width_px: f64, sampling_data: &SamplingData) {
+    let max_h_px = compute_max_media_height_px(sampling_data);
+    if let Ok(node_list) = container.query_selector_all("img") {
+        let len = node_list.length();
+        for i in 0..len {
+            if let Some(node) = node_list.item(i) {
+                if let Some(img) = node.dyn_ref::<HtmlImageElement>() {
+                    let el: &Element = img.as_ref();
+                    // 이미 width/height 속성이 있으면 건드리지 않음
+                    if el.has_attribute("width") || el.has_attribute("height") { continue; }
+
+                    let raw_src = el.get_attribute("src").unwrap_or_default();
+                    let abs_src = img.src();
+
+                    if let Some(dim) = find_image_dimension_for_src(&raw_src, &abs_src, image_dims) {
+                        let nat_w = dim.width.max(1) as f64;
+                        let nat_h = dim.height.max(1) as f64;
+                        if nat_w > 0.0 && nat_h > 0.0 && content_width_px > 0.0 {
+                            let scale_w = (content_width_px.min(nat_w)) / nat_w;
+                            let scale_h = if max_h_px > 0.0 { (max_h_px / nat_h).min(1.0) } else { 1.0 };
+                            let scale = scale_w.min(scale_h).max(0.0);
+                            let target_w = (nat_w * scale).max(1.0);
+                            let target_h = (nat_h * scale).max(1.0);
+                            let _ = el.set_attribute("width", &(target_w.round() as i32).to_string());
+                            let _ = el.set_attribute("height", &(target_h.round() as i32).to_string());
+                            // 캐시: 검증 단계에서 재계산하지 않도록 저장
+                            let _ = el.set_attribute("data-wasm-target-width", &(target_w.round() as i32).to_string());
+                            let _ = el.set_attribute("data-wasm-target-height", &(target_h.round() as i32).to_string());
+                            console_log!(
+                                "🖼️ img 치수 주입(스케일 적용): src='{}' → nat={}x{}, contentW={:.3}, maxH={:.3} → {}x{}",
+                                raw_src,
+                                dim.width,
+                                dim.height,
+                                content_width_px,
+                                max_h_px,
+                                target_w.round() as i32,
+                                target_h.round() as i32
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 미디어(이미지/오디오/비디오) 자리 예약 및 기본 보정 적용
+/// 현재는 이미지에 한해 사전 치수를 사용하여 width/height 속성을 주입한다.
+/// 오디오/비디오는 향후 필요 시 메타데이터 기반 높이 예약을 추가할 수 있다.
+fn apply_media_placeholders(container: &Element, sampling_data: &SamplingData, content_width_px: f64) {
+    if let Some(img_map) = sampling_data.image_dimensions.as_ref() {
+        apply_image_dimensions_to_imgs(container, img_map, content_width_px, sampling_data);
+    }
+    // TODO: audio/video 처리(필요 시): 트랙 유무에 따른 기본 높이 예약 등
+}
+
+/// 측정용: img를 블록 플레이스홀더 div로 교체하여 레이아웃 기여를 안정화
+fn transform_imgs_to_placeholders(
+    window: &Window,
+    document: &Document,
+    container: &Element,
+    sampling_data: &SamplingData,
+    content_width_px: f64,
+    is_scroll_mode: bool,
+) {
+    let node_list = match container.query_selector_all("img") { Ok(list) => list, Err(_) => return };
+    let len = node_list.length();
+    if len == 0 { return; }
+
+    let max_h_px = compute_max_media_height_px(sampling_data);
+
+    for i in 0..len {
+        if let Some(node) = node_list.item(i) {
+            if let Some(img) = node.dyn_ref::<HtmlImageElement>() {
+                let el: &Element = img.as_ref();
+
+                // 목표 크기 계산: 캐시 우선 → 치수 맵으로 산출
+                let mut target_w_opt = el
+                    .get_attribute("data-wasm-target-width")
+                    .and_then(|s| s.parse::<f64>().ok());
+                let mut target_h_opt = el
+                    .get_attribute("data-wasm-target-height")
+                    .and_then(|s| s.parse::<f64>().ok());
+
+                if target_w_opt.is_none() || target_h_opt.is_none() {
+                    if let Some(map) = sampling_data.image_dimensions.as_ref() {
+                        let raw_src = el.get_attribute("src").unwrap_or_default();
+                        let abs_src = img.src();
+                        if let Some(dim) = find_image_dimension_for_src(&raw_src, &abs_src, map) {
+                            let nat_w = dim.width.max(1) as f64;
+                            let nat_h = dim.height.max(1) as f64;
+                            if nat_w > 0.0 && nat_h > 0.0 && content_width_px > 0.0 {
+                                let scale_w = (content_width_px.min(nat_w)) / nat_w;
+                                let scale_h = if max_h_px > 0.0 { (max_h_px / nat_h).min(1.0) } else { 1.0 };
+                                let scale = scale_w.min(scale_h).max(0.0);
+                                target_w_opt = Some((nat_w * scale).max(1.0).round());
+                                target_h_opt = Some((nat_h * scale).max(1.0).round());
+                            }
+                        }
+                    }
+                }
+
+                let (mut target_w, mut target_h) = match (target_w_opt, target_h_opt) {
+                    (Some(w), Some(h)) => (w, h),
+                    _ => continue,
+                };
+
+                // paged 모드에서는 1 페이지 수용을 위해 상한 적용
+                if !is_scroll_mode && max_h_px > 0.0 {
+                    if target_h > max_h_px { target_h = max_h_px; }
+                }
+
+                // 원본 마진 복제
+                let (mt, mr, mb, ml) = window
+                    .get_computed_style(&el)
+                    .ok()
+                    .flatten()
+                    .map(|cs| {
+                        let mt = parse_css_px(&cs.get_property_value("margin-top").unwrap_or_default());
+                        let mr = parse_css_px(&cs.get_property_value("margin-right").unwrap_or_default());
+                        let mb = parse_css_px(&cs.get_property_value("margin-bottom").unwrap_or_default());
+                        let ml = parse_css_px(&cs.get_property_value("margin-left").unwrap_or_default());
+                        (mt, mr, mb, ml)
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0, 0.0));
+
+                // 플레이스홀더 생성 및 스타일 적용
+                let ph = match document.create_element("div") { Ok(e) => e, Err(_) => continue };
+                let _ = ph.set_attribute("data-wasm-img", "true");
+                if let Some(ph_html) = ph.dyn_ref::<HtmlElement>() {
+                    let mut style_fragments: Vec<String> = Vec::new();
+                    style_fragments.push("display:block !important".to_string());
+                    style_fragments.push("box-sizing:border-box !important".to_string());
+                    style_fragments.push(format!("width:{:.0}px !important", target_w));
+                    style_fragments.push(format!("height:{:.0}px !important", target_h));
+                    style_fragments.push("float:none !important".to_string());
+                    style_fragments.push("overflow:hidden !important".to_string());
+                    if mt > 0.0 { style_fragments.push(format!("margin-top:{:.0}px !important", mt)); }
+                    if mr > 0.0 { style_fragments.push(format!("margin-right:{:.0}px !important", mr)); }
+                    if mb > 0.0 { style_fragments.push(format!("margin-bottom:{:.0}px !important", mb)); }
+                    if ml > 0.0 { style_fragments.push(format!("margin-left:{:.0}px !important", ml)); }
+                    if !is_scroll_mode {
+                        style_fragments.push("-webkit-column-break-inside: avoid !important".to_string());
+                        style_fragments.push("page-break-inside: avoid !important".to_string());
+                        style_fragments.push("break-inside: avoid !important".to_string());
+                    }
+                    let style_text = style_fragments.join("; ");
+                    ph_html.style().set_css_text(&style_text);
+                }
+
+                // figure 부모가 있으면 단편화 회피 부여
+                if let Some(parent) = el.parent_element() {
+                    let tag = parent.tag_name();
+                    if tag.eq_ignore_ascii_case("figure") && !is_scroll_mode {
+                        let prev = parent.get_attribute("style").unwrap_or_default();
+                        let append = "-webkit-column-break-inside: avoid !important; page-break-inside: avoid !important; break-inside: avoid !important";
+                        let new_style = if prev.is_empty() { append.to_string() } else { format!("{}; {}", prev, append) };
+                        let _ = parent.set_attribute("style", &new_style);
+                    }
+                }
+
+                // 교체
+                if let Some(parent_node) = el.parent_node() {
+                    let _ = parent_node.replace_child(ph.as_ref(), el);
+                }
+            }
+        }
+    }
+}

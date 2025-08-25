@@ -212,7 +212,7 @@ internal class EpubPageCalculationManager(
                     val result = wasmPageCalculator.calculatePages(html, cssText, samplingJson)
                     Log.d(
                         "EpubPageCalc",
-                        "[전체] 리소스 결과 status=${result.status} totalPages=${result.totalPages}"
+                        "[전체] 리소스 결과 result=${result}"
                     )
 
                     when (result.status) {
