@@ -21,6 +21,10 @@ import org.readium.r2.shared.InternalReadiumApi
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.Link
 import java.net.URI
+import org.readium.r2.shared.publication.filterByMediaType
+import org.readium.r2.shared.publication.filterByMediaTypes
+import org.readium.r2.shared.publication.flatten
+import org.readium.r2.shared.util.mediatype.MediaType
 
 /**
  * Manager for calculating total pages in EPUB publications using WASM-based approach.
@@ -36,7 +40,20 @@ internal class EpubPageCalculationManager(
         DefaultWasmPageCalculator(context)
     }
 
+    /**
+     * Flow of total pages count for the entire publication.
+     * Null indicates the count is still being calculated.
+     */
     private val _totalPagesFlow = MutableStateFlow<Int?>(null)
+    val totalPages: StateFlow<Int?> = _totalPagesFlow
+
+    // Exposes per-resource page counts as they are computed: href -> pages
+    private val _pagesByHrefFlow = MutableStateFlow<MutableMap<String, Int>>(mutableMapOf())
+    val pagesByHref: StateFlow<Map<String, Int>> = _pagesByHrefFlow
+
+    // Exposes per-reading-order index page counts; aligned with `readingOrder`
+    private val _pagesByIndexFlow = MutableStateFlow(mutableListOf(readingOrder.size))
+    val pagesByIndex: StateFlow<List<Int>> = _pagesByIndexFlow
 
     // Cache of image dimensions for all EPUB-internal images. Built once, reused.
     private var imageDimensionsCache: JSONObject? = null
@@ -49,12 +66,6 @@ internal class EpubPageCalculationManager(
     private val REGKEY_ASSET_AFTER = "@assets/readium/readium-css/ReadiumCSS-after.css"
     private val ASSET_PATH_BEFORE = "readium/readium-css/ReadiumCSS-before.css"
     private val ASSET_PATH_AFTER = "readium/readium-css/ReadiumCSS-after.css"
-
-    /**
-     * Flow of total pages count for the entire publication.
-     * Null indicates the count is still being calculated.
-     */
-    val totalPages: StateFlow<Int?> = _totalPagesFlow
 
     /**
      * Initialize and start the page calculation process.
@@ -282,8 +293,21 @@ internal class EpubPageCalculationManager(
 
         var totalPageCount = 0
 
-        // Process each resource in reading order
-        for (link in readingOrder) {
+        // Reset per-resource results for a fresh run
+        _pagesByHrefFlow.value = mutableMapOf()
+        _pagesByIndexFlow.value = mutableListOf()
+
+        // Build a flattened list of links (includes children), filter HTML-ish, and dedupe by href
+        val flatLinks: List<Link> = try {
+            readingOrder.flatten()
+        } catch (_: Throwable) {
+            readingOrder
+        }
+
+        val linksToProcess: List<Link> = flatLinks.filterByMediaTypes(listOf(MediaType.HTML, MediaType.XHTML))
+
+        // Process each resource (flattened)
+        for (link in linksToProcess) {
             val resource = publication.get(link)
             val documentHref = link.href?.toString() ?: ""
             Log.d("EpubPageCalc", "[전체] 리소스 페이지 계산: ${link.href}")
@@ -321,6 +345,7 @@ internal class EpubPageCalculationManager(
                                 "[전체] WASM 정상 계산, 페이지 수: ${result.totalPages}"
                             )
                             totalPageCount += result.totalPages
+                            recordPageCountFor(link, result.totalPages)
                         }
 
                         WasmCalculationResult.Status.FALLBACK_NEEDED -> {
@@ -330,12 +355,14 @@ internal class EpubPageCalculationManager(
                                 "[전체] WASM Fallback 필요, WebView 기반 계산 페이지 수: $count"
                             )
                             totalPageCount += count
+                            recordPageCountFor(link, count)
                         }
 
                         WasmCalculationResult.Status.ERROR -> {
                             val est = estimatePagesByContentSize(html, samplingJson)
                             Log.d("EpubPageCalc", "[전체] WASM 계산 오류, 컨텐츠 길이 기반 추정 페이지 수: $est")
                             totalPageCount += est
+                            recordPageCountFor(link, est)
                         }
                     }
                 }
@@ -630,11 +657,17 @@ internal class EpubPageCalculationManager(
     ) {
         Log.d("EpubPageCalc", "[폴백] WebView 기반 전체 페이지 계산 시작")
         var totalPages = 0
+        // Reset per-resource results for fallback run
+        _pagesByHrefFlow.value = mutableMapOf()
+        _pagesByIndexFlow.value = mutableListOf()
         for (i in readingOrder.indices) {
             val fragment = getFragmentAt(i)
             val pages = fragment?.webView?.numPages ?: 1
             Log.d("EpubPageCalc", "[폴백] 리소스 인덱스 $i -> $pages 페이지")
             totalPages += pages
+            // Record by index and href if available
+            val link = readingOrder[i]
+            recordPageCountFor(link, pages)
         }
         Log.d("EpubPageCalc", "[폴백] WebView 기반 총 페이지: $totalPages")
         _totalPagesFlow.value = totalPages
@@ -694,5 +727,27 @@ internal class EpubPageCalculationManager(
             if (content.isNotBlank()) result.add(content)
         }
         return result
+    }
+
+    /**
+     * Record a per-resource page count into both href and index-based stores.
+     */
+    private fun recordPageCountFor(link: Link, pages: Int) {
+        // Update href-based map
+        val href = link.href?.toString()
+        if (!href.isNullOrBlank()) {
+            val updated = _pagesByHrefFlow.value
+            updated[href] = pages
+            _pagesByHrefFlow.value = updated
+        }
+        // Update index-based list if this link exists in the provided reading order
+        val idx = readingOrder.indexOfFirst { it.href == link.href }
+        if (idx >= 0) {
+            val current = _pagesByIndexFlow.value
+            if (idx < current.size) {
+                current[idx] = pages
+                _pagesByIndexFlow.value = current
+            }
+        }
     }
 }
