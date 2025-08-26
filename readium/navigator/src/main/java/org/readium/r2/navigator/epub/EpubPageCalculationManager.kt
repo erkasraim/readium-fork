@@ -39,7 +39,7 @@ internal class EpubPageCalculationManager(
     }
 
     // Debug logging flag to control log emission
-    private var debugLogsEnabled: Boolean = true
+    private var debugLogsEnabled: Boolean = false
 
     // Allows callers to toggle debug logging
     fun setDebugLogging(enabled: Boolean) {
@@ -47,16 +47,20 @@ internal class EpubPageCalculationManager(
     }
 
     // Logging helpers to avoid building strings when disabled
-    private inline fun logD(crossinline message: () -> String) {
-        if (debugLogsEnabled) Log.d(TAG, message())
+    private inline fun logD(forcePrint: Boolean = false, crossinline message: () -> String) {
+        if (debugLogsEnabled || forcePrint) Log.d(TAG, message())
     }
 
-    private inline fun logE(crossinline message: () -> String) {
-        if (debugLogsEnabled) Log.e(TAG, message())
+    private inline fun logI(forcePrint: Boolean = false, crossinline message: () -> String) {
+        if (debugLogsEnabled || forcePrint) Log.i(TAG, message())
     }
 
-    private inline fun logW(crossinline message: () -> String) {
-        if (debugLogsEnabled) Log.w(TAG, message())
+    private inline fun logE(forcePrint: Boolean = false, crossinline message: () -> String) {
+        if (debugLogsEnabled || forcePrint) Log.e(TAG, message())
+    }
+
+    private inline fun logW(forcePrint: Boolean = false, crossinline message: () -> String) {
+        if (debugLogsEnabled || forcePrint) Log.w(TAG, message())
     }
 
     private val wasmPageCalculator: WasmPageCalculator by lazy {
@@ -344,7 +348,7 @@ internal class EpubPageCalculationManager(
         for (link in linksToProcess) {
             val resource = publication.get(link)
             val documentHref = link.href?.toString() ?: ""
-            logD { "[전체] 리소스 페이지 계산: ${link.href}" }
+            logD(forcePrint = true) { "[전체] 리소스 페이지 계산: ${link.href}" }
             if (resource != null) {
                 val htmlResult = resource.read()
                 htmlResult.getOrNull()?.let { bytes ->
@@ -364,7 +368,7 @@ internal class EpubPageCalculationManager(
                         inlineStylesJson = inlineStylesJson,
                         samplingJson = samplingJson
                     )
-                    logD { "[전체] 리소스 결과 result=${result}" }
+                    logD(forcePrint = true) { "[전체] 리소스 결과 result=${result}" }
 
                     when (result.status) {
                         WasmCalculationResult.Status.SUCCESS -> {
@@ -391,7 +395,7 @@ internal class EpubPageCalculationManager(
             }
         }
 
-        logD { "[전체] 전체 계산 완료, totalPageCount=$totalPageCount" }
+        logI(forcePrint = true) { "[전체] 전체 계산 완료, totalPageCount=$totalPageCount" }
         _totalPagesFlow.value = totalPageCount
     }
 
@@ -473,6 +477,43 @@ internal class EpubPageCalculationManager(
                 body.appendChild(testSpan);
                 const rect = testSpan.getBoundingClientRect();
                 body.removeChild(testSpan);
+                
+                // Canvas 기반 폰트 메트릭 계산 (ascent, descent, lineGap)
+                const fontSizePx = parseFloat(csBody.fontSize) || 16;
+                const computedLineHeight = parseFloat(csBody.lineHeight) || (fontSizePx * 1.2);
+                let ascent = 0, descent = 0, lineGap = 0;
+                let canvas = null;
+                let ctx = null;
+                try {
+                    canvas = document.createElement('canvas');
+                    ctx = canvas.getContext('2d');
+                    if (ctx) {
+                        const fontStyle = (csBody.fontStyle || 'normal');
+                        const fontWeight = (csBody.fontWeight || '400');
+                        const fontFamily = (csBody.fontFamily || 'serif');
+                        ctx.font = fontStyle + ' ' + fontWeight + ' ' + fontSizePx + 'px ' + fontFamily;
+                        // 'Hg'는 대략적인 실제 어센트/디센트 측정에 적합
+                        const m = ctx.measureText('Hg');
+                        const a = (m.actualBoundingBoxAscent ?? m.fontBoundingBoxAscent ?? (fontSizePx * 0.8));
+                        const d = (m.actualBoundingBoxDescent ?? m.fontBoundingBoxDescent ?? (fontSizePx * 0.2));
+                        ascent = a;
+                        descent = d;
+                        lineGap = Math.max(0, computedLineHeight - a - d);
+                    } else {
+                        ascent = fontSizePx * 0.8;
+                        descent = fontSizePx * 0.2;
+                        lineGap = Math.max(0, computedLineHeight - ascent - descent);
+                    }
+                } catch (e) {
+                    ascent = fontSizePx * 0.8;
+                    descent = fontSizePx * 0.2;
+                    lineGap = Math.max(0, computedLineHeight - ascent - descent);
+                } finally {
+                    // 명시적으로 참조 해제하여 GC를 돕는다 (DOM에 붙이지 않았지만 안전하게 정리)
+                    try { if (canvas) { canvas.width = 0; canvas.height = 0; if (canvas.remove) canvas.remove(); } } catch (_) {}
+                    ctx = null;
+                    canvas = null;
+                }
                 
                 // CSS에 정의된 모든 태그의 스타일을 수집 (가상 요소 생성)
                 const elementStyles = {};
@@ -564,7 +605,10 @@ internal class EpubPageCalculationManager(
                     fontMetrics: {
                         fontSize: parseFloat(csBody.fontSize) || 16,
                         lineHeight: parseFloat(csBody.lineHeight) || (parseFloat(csBody.fontSize) * 1.2),
-                        characterWidth: rect.width / testText.length
+                        characterWidth: rect.width / testText.length,
+                        ascent: ascent,
+                        descent: descent,
+                        lineGap: lineGap
                     },
                     cssVariables: cssVariables,
                     elementStyles: elementStyles,
@@ -614,7 +658,19 @@ internal class EpubPageCalculationManager(
         } catch (t: Throwable) {
             logW { "[샘플링] 이미지 치수 수집 실패: ${t.message}" }
         }
-        Log.d("EpubPageCalc", "[샘플링] WASM 호환 샘플링 데이터 수집 완료")
+        // 폰트 메트릭 로깅
+        try {
+            val fm = obj.optJSONObject("fontMetrics")
+            val fontSize = fm?.optDouble("fontSize")
+            val lineHeight = fm?.optDouble("lineHeight")
+            val ascent = fm?.optDouble("ascent")
+            val descent = fm?.optDouble("descent")
+            val lineGap = fm?.optDouble("lineGap")
+            logD { "[샘플링] 폰트 메트릭: size=${fontSize}, lineHeight=${lineHeight}, ascent=${ascent}, descent=${descent}, lineGap=${lineGap}" }
+        } catch (t: Throwable) {
+            logW { "[샘플링] 폰트 메트릭 로깅 실패: ${t.message}" }
+        }
+        logD { "[샘플링] WASM 호환 샘플링 데이터 수집 완료" }
 
         return obj.toString()
     }

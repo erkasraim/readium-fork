@@ -358,6 +358,8 @@ pub struct SamplingData {
     pub css_variables: CssVariables,
     #[serde(rename = "bodyStyle")]
     pub body_style: Option<BodyStyle>,
+    #[serde(rename = "fontMetrics")]
+    pub font_metrics: Option<FontMetrics>,
     #[serde(rename = "rootStyleAttr")]
     pub root_style_attr: Option<String>,
     #[serde(rename = "documentLang")]
@@ -371,7 +373,20 @@ pub struct SamplingData {
     pub image_dimensions: Option<HashMap<String, ImageDimension>>,
 }
 
-// (removed) FontMetrics: no longer needed
+/// 샘플링에서 전달되는 폰트 메트릭(픽셀 단위)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FontMetrics {
+    #[serde(rename = "fontSize")]
+    pub font_size: f64,
+    #[serde(rename = "lineHeight")]
+    pub line_height: f64,
+    #[serde(rename = "characterWidth")]
+    pub character_width: f64,
+    pub ascent: f64,
+    pub descent: f64,
+    #[serde(rename = "lineGap")]
+    pub line_gap: f64,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CssVariables {
@@ -475,6 +490,14 @@ pub fn calculate_pages_with_css(html: &str, css_text: &str, sampling_data_json: 
 /// 외부 CSS가 있는 경우의 페이지 계산 로직
 fn calculate_pages_internal_with_css(html: &str, css_text: &str, sampling_data: &SamplingData) -> PageCalculationResult {
     console_log!("🧮 페이지 계산 시작");
+
+    // 폰트 메트릭 로깅 (있을 경우)
+    if let Some(fm) = &sampling_data.font_metrics {
+        console_log!(
+            "🔤 FontMetrics: fontSize={:.3}, lineHeight={:.3}, charWidth={:.3}, ascent={:.3}, descent={:.3}, lineGap={:.3}",
+            fm.font_size, fm.line_height, fm.character_width, fm.ascent, fm.descent, fm.line_gap
+        );
+    }
 
     let window = match window() {
         Some(w) => w,
@@ -897,32 +920,6 @@ fn analyze_html_content(document: &Document, sampling_data: &SamplingData) {
     console_log!("📊 === HTML 분석 완료 ===");
 }
 
-/// elementStyles에서 특정 요소의 마진을 추출하는 헬퍼 함수
-fn get_element_margin_from_styles(element_styles: &HashMap<String, HashMap<String, String>>, element_name: &str, default_margin: i32) -> i32 {
-    if let Some(styles) = element_styles.get(element_name) {
-        // 각 방향별 margin 값을 확인하고, 상하 margin만 합산하여 반환
-        let margin_top = styles.get("marginTop")
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
-        let margin_bottom = styles.get("marginBottom")
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
-        
-        let total_margin = margin_top + margin_bottom;
-        if total_margin > 0 {
-            return total_margin;
-        }
-        
-        // 기존 방식(margin 필드)도 fallback으로 유지
-        if let Some(margin_str) = styles.get("margin") {
-            if let Ok(margin_value) = margin_str.parse::<i32>() {
-                return margin_value;
-            }
-        }
-    }
-    default_margin
-}
-
 /// 특정 태그의 요소 개수를 세는 함수
 fn count_elements(document: &Document, tag_name: &str) -> i32 {
     let elements = document.get_elements_by_tag_name(tag_name);
@@ -1108,16 +1105,26 @@ fn apply_image_dimensions_to_imgs(container: &Element, image_dims: &HashMap<Stri
                             let _ = el.set_attribute("height", &(target_h.round() as i32).to_string());
                             // 캐시: 검증 단계에서 재계산하지 않도록 저장
                             let _ = el.set_attribute("data-wasm-target-width", &(target_w.round() as i32).to_string());
-                            let _ = el.set_attribute("data-wasm-target-height", &(target_h.round() as i32).to_string());
+                            // lineGap(폰트 메트릭)을 추가한 값을 캐시에 저장하여 블록 플레이스홀더 높이에 반영
+                            let line_gap = sampling_data
+                                .font_metrics
+                                .as_ref()
+                                .map(|fm| fm.line_gap)
+                                .unwrap_or(0.0);
+                            let adjusted_target_h_for_cache = (target_h + line_gap).round() as i32;
+                            let _ = el.set_attribute(
+                                "data-wasm-target-height",
+                                &adjusted_target_h_for_cache.to_string(),
+                            );
                             console_log!(
-                                "🖼️ img 치수 주입(스케일 적용): src='{}' → nat={}x{}, contentW={:.3}, maxH={:.3} → {}x{}",
+                                "🖼️ img 치수 주입(스케일 적용): src='{}' → nat={}x{}, contentW={:.3}, maxH={:.3} → {}x{:.3}",
                                 raw_src,
                                 dim.width,
                                 dim.height,
                                 content_width_px,
                                 max_h_px,
                                 target_w.round() as i32,
-                                target_h.round() as i32
+                                target_h + line_gap
                             );
                         }
                     }
