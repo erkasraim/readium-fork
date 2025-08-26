@@ -158,8 +158,7 @@ public class EpubNavigatorFragment internal constructor(
     public fun getCurrentReadingProgress(): Double? {
         return pageCalculationManager.getCurrentReadingProgress(
             currentPagerPosition = currentPagerPosition,
-            getCurrentFragment = { currentReflowablePageFragment },
-            getFragmentAt = { index -> fragmentAt(index) as? R2EpubPageFragment }
+            getCurrentFragment = { currentReflowablePageFragment }
         )
     }
 

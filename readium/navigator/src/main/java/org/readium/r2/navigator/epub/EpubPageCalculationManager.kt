@@ -52,7 +52,7 @@ internal class EpubPageCalculationManager(
     val pagesByHref: StateFlow<Map<String, Int>> = _pagesByHrefFlow
 
     // Exposes per-reading-order index page counts; aligned with `readingOrder`
-    private val _pagesByIndexFlow = MutableStateFlow(mutableListOf(readingOrder.size))
+    private val _pagesByIndexFlow = MutableStateFlow(MutableList(readingOrder.size) { 0 })
     val pagesByIndex: StateFlow<List<Int>> = _pagesByIndexFlow
 
     // Cache of image dimensions for all EPUB-internal images. Built once, reused.
@@ -260,24 +260,36 @@ internal class EpubPageCalculationManager(
      */
     fun getCurrentReadingProgress(
         currentPagerPosition: Int,
-        getCurrentFragment: () -> R2EpubPageFragment?,
-        getFragmentAt: (Int) -> R2EpubPageFragment?
+        getCurrentFragment: () -> R2EpubPageFragment?
     ): Double? {
         val total = _totalPagesFlow.value ?: return null
         if (total <= 0) return 0.0
+        if (currentPagerPosition !in readingOrder.indices) return 0.0
 
-        val currentFragment = getCurrentFragment()
-        val currentPageInResource = currentFragment?.webView?.mCurItem ?: 0
+        // Snapshot maps to avoid concurrent updates during computation
+        val pagesByHrefSnapshot = _pagesByHrefFlow.value.toMap()
 
-        // Calculate pages before current resource
+        // Sum known pages for resources before the current index, without instantiating fragments
         var pagesBefore = 0
         for (i in 0 until currentPagerPosition) {
-            val fragment = getFragmentAt(i)
-            pagesBefore += fragment?.webView?.numPages ?: 1
+            val href = readingOrder[i].href?.toString()
+            pagesBefore += if (href != null) (pagesByHrefSnapshot[href] ?: 1) else 1
         }
 
-        val currentAbsolutePage = pagesBefore + currentPageInResource + 1
-        return (currentAbsolutePage.toDouble() / total).coerceIn(0.0, 1.0)
+        // Current resource page within its own pagination (0-based in WebView)
+        val currentFragment = getCurrentFragment()
+        val currentPageInResourceZeroBased = currentFragment?.webView?.mCurItem ?: 0
+
+        // Total pages for the current resource from the computed map, or fall back to WebView if available
+        val currentHref = readingOrder[currentPagerPosition].href?.toString()
+        val currentResourceTotalPages = currentHref?.let { pagesByHrefSnapshot[it] }
+            ?: currentFragment?.webView?.numPages
+            ?: 1
+
+        val currentPageOneBased = (currentPageInResourceZeroBased + 1).coerceIn(1, currentResourceTotalPages)
+        val currentAbsolutePage = (pagesBefore + currentPageOneBased).coerceAtMost(total)
+
+        return (currentAbsolutePage.toDouble() / total.toDouble()).coerceIn(0.0, 1.0)
     }
 
     /**
@@ -295,7 +307,7 @@ internal class EpubPageCalculationManager(
 
         // Reset per-resource results for a fresh run
         _pagesByHrefFlow.value = mutableMapOf()
-        _pagesByIndexFlow.value = mutableListOf()
+        _pagesByIndexFlow.value = MutableList(readingOrder.size) { 0 }
 
         // Build a flattened list of links (includes children), filter HTML-ish, and dedupe by href
         val flatLinks: List<Link> = try {
@@ -659,7 +671,7 @@ internal class EpubPageCalculationManager(
         var totalPages = 0
         // Reset per-resource results for fallback run
         _pagesByHrefFlow.value = mutableMapOf()
-        _pagesByIndexFlow.value = mutableListOf()
+        _pagesByIndexFlow.value = MutableList(readingOrder.size) { 0 }
         for (i in readingOrder.indices) {
             val fragment = getFragmentAt(i)
             val pages = fragment?.webView?.numPages ?: 1
