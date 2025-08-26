@@ -21,7 +21,6 @@ import org.readium.r2.shared.InternalReadiumApi
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.Link
 import java.net.URI
-import org.readium.r2.shared.publication.filterByMediaType
 import org.readium.r2.shared.publication.filterByMediaTypes
 import org.readium.r2.shared.publication.flatten
 import org.readium.r2.shared.util.mediatype.MediaType
@@ -35,9 +34,35 @@ internal class EpubPageCalculationManager(
     private val publication: Publication,
     private val readingOrder: List<Link>
 ) {
+    companion object {
+        private const val TAG = "EpubPageCalc"
+    }
+
+    // Debug logging flag to control log emission
+    private var debugLogsEnabled: Boolean = true
+
+    // Allows callers to toggle debug logging
+    fun setDebugLogging(enabled: Boolean) {
+        debugLogsEnabled = enabled
+    }
+
+    // Logging helpers to avoid building strings when disabled
+    private inline fun logD(crossinline message: () -> String) {
+        if (debugLogsEnabled) Log.d(TAG, message())
+    }
+
+    private inline fun logE(crossinline message: () -> String) {
+        if (debugLogsEnabled) Log.e(TAG, message())
+    }
+
+    private inline fun logW(crossinline message: () -> String) {
+        if (debugLogsEnabled) Log.w(TAG, message())
+    }
 
     private val wasmPageCalculator: WasmPageCalculator by lazy {
-        DefaultWasmPageCalculator(context)
+        DefaultWasmPageCalculator(context).also { calculator ->
+            calculator.enableDebugLogs = debugLogsEnabled
+        }
     }
 
     /**
@@ -74,12 +99,12 @@ internal class EpubPageCalculationManager(
         getCurrentReflowablePageFragment: () -> R2EpubPageFragment?,
         getFragmentAt: (Int) -> R2EpubPageFragment?
     ) {
-        Log.e("EpubPageCalc", "🔥 startCalculation() 호출됨!")
+        logE { "🔥 startCalculation() 호출됨!" }
 
         // First initialize WASM
         initialize()
 
-        Log.e("EpubPageCalc", "🔥 calculateTotalPages() 호출...")
+        logE { "🔥 calculateTotalPages() 호출..." }
         // Then start the calculation process
         calculateTotalPages(
             getCurrentFragment = getCurrentReflowablePageFragment,
@@ -91,13 +116,13 @@ internal class EpubPageCalculationManager(
      * Initialize WASM calculator and start total page count calculation.
      */
     suspend fun initialize() {
-        Log.e("EpubPageCalc", "🔥 EpubPageCalculationManager.initialize() 호출됨!")
+        logE { "🔥 EpubPageCalculationManager.initialize() 호출됨!" }
 
         if (wasmPageCalculator.initialize()) {
-            Log.e("EpubPageCalc", "🔥 WASM 초기화 성공! 테스트 실행...")
+            logE { "🔥 WASM 초기화 성공! 테스트 실행..." }
 
             val testResult = wasmPageCalculator.testWasmConnection()
-            Log.e("EpubPageCalc", "🧪 WASM 테스트 결과: $testResult")
+            logE { "🧪 WASM 테스트 결과: $testResult" }
 
             // Step 2: Build CSS registry once and register to WASM.
             try {
@@ -105,21 +130,21 @@ internal class EpubPageCalculationManager(
                     val registryJson = buildCssRegistryJson()
                     val ok = wasmPageCalculator.registerCssRegistry(registryJson)
                     cssRegistryRegistered = ok
-                    Log.e(
-                        "EpubPageCalc", "📦 CSS 레지스트리 등록 결과: $ok, size=${
+                    logE {
+                        "📦 CSS 레지스트리 등록 결과: $ok, size=${
                             try {
                                 JSONObject(registryJson).length()
                             } catch (_: Throwable) {
                                 -1
                             }
                         }"
-                    )
+                    }
                 }
             } catch (t: Throwable) {
-                Log.w("EpubPageCalc", "⚠️ CSS 레지스트리 등록 실패: ${t.message}")
+                logW { "⚠️ CSS 레지스트리 등록 실패: ${t.message}" }
             }
         } else {
-            Log.e("EpubPageCalc", "❌ WASM 초기화 실패!")
+            logE { "❌ WASM 초기화 실패!" }
         }
     }
 
@@ -160,10 +185,7 @@ internal class EpubPageCalculationManager(
                 }
                 registry.put(href, obj)
             } catch (t: Throwable) {
-                Log.w(
-                    "EpubPageCalc",
-                    "[CSS DEBUG] CSS 레지스트리 항목 생성 실패: ${link.href} -> ${t.message}"
-                )
+                logW { "[CSS DEBUG] CSS 레지스트리 항목 생성 실패: ${link.href} -> ${t.message}" }
             }
         }
 
@@ -178,9 +200,9 @@ internal class EpubPageCalculationManager(
                     put("text", text)
                 }
                 registry.put(regKey, obj)
-                Log.d("EpubPageCalc", "[CSS DEBUG] 자산 CSS 등록: $regKey (${text.length} chars)")
+                logD { "[CSS DEBUG] 자산 CSS 등록: $regKey (${text.length} chars)" }
             } catch (t: Throwable) {
-                Log.w("EpubPageCalc", "[CSS DEBUG] 자산 CSS 로드 실패: $assetPath -> ${t.message}")
+                logW { "[CSS DEBUG] 자산 CSS 로드 실패: $assetPath -> ${t.message}" }
             }
         }
         putAssetToRegistry(REGKEY_ASSET_BEFORE, ASSET_PATH_BEFORE)
@@ -196,15 +218,15 @@ internal class EpubPageCalculationManager(
         getCurrentFragment: () -> R2EpubPageFragment?,
         getFragmentAt: (Int) -> R2EpubPageFragment?
     ) {
-        Log.e("EpubPageCalc", "🔥 calculateTotalPages() 호출됨!")
-        Log.d("EpubPageCalc", "[전체] 전체 EPUB 페이지 계산 시작")
+        logE { "🔥 calculateTotalPages() 호출됨!" }
+        logD { "[전체] 전체 EPUB 페이지 계산 시작" }
 
         // Wait for ViewPager and fragments to be created
         // First, try immediately without any delay
         var currentFragment: R2EpubPageFragment? = getCurrentFragment()
 
         if (currentFragment == null) {
-            Log.e("EpubPageCalc", "🔥 첫 번째 시도 실패, 재시도 루프 시작...")
+            logE { "🔥 첫 번째 시도 실패, 재시도 루프 시작..." }
 
             var attempts = 0
             val maxAttempts = 10
@@ -212,41 +234,41 @@ internal class EpubPageCalculationManager(
 
             while (currentFragment == null && attempts < maxAttempts) {
                 attempts++
-                Log.e("EpubPageCalc", "🔥 시도 ${attempts + 1}:")
+                logE { "🔥 시도 ${attempts + 1}:" }
 
-                Log.e("EpubPageCalc", "  - ${delayMs}ms 대기 중...")
+                logE { "  - ${delayMs}ms 대기 중..." }
                 delay(delayMs)
 
                 currentFragment = getCurrentFragment()
-                Log.e("EpubPageCalc", "  - 결과 fragment: $currentFragment")
+                logE { "  - 결과 fragment: $currentFragment" }
 
                 // Gradually increase delay for subsequent attempts (exponential backoff)
                 delayMs = minOf(delayMs * 2, 1000L) // Max 1 second delay
             }
         } else {
-            Log.e("EpubPageCalc", "✅ 첫 번째 시도에서 fragment 발견!")
+            logE { "✅ 첫 번째 시도에서 fragment 발견!" }
         }
 
         if (currentFragment == null) {
-            Log.e("EpubPageCalc", "❌ 현재 fragment를 찾을 수 없음, WebView fallback 사용")
+            logE { "❌ 현재 fragment를 찾을 수 없음, WebView fallback 사용" }
             calculateTotalPagesWebViewFallback(getFragmentAt)
             return
         }
 
-        Log.e("EpubPageCalc", "✅ 현재 fragment 찾음: $currentFragment")
+        logE { "✅ 현재 fragment 찾음: $currentFragment" }
 
         // Wait until the fragment is loaded
-        Log.e("EpubPageCalc", "🔥 fragment.isLoaded 체크 중...")
+        logE { "🔥 fragment.isLoaded 체크 중..." }
         currentFragment.isLoaded.collect { isLoaded ->
-            Log.e("EpubPageCalc", "🔥 fragment.isLoaded = $isLoaded")
+            logE { "🔥 fragment.isLoaded = $isLoaded" }
             if (isLoaded) {
-                Log.d("EpubPageCalc", "[전체] 현재 리소스의 샘플링 데이터 수집 완료, 각 리소스별 페이지 계산 시작")
+                logD { "[전체] 현재 리소스의 샘플링 데이터 수집 완료, 각 리소스별 페이지 계산 시작" }
 //                // 디버그: 레이아웃/변수/하단 갭 분석 덤프
 //                try {
 //                    debugDumpLayoutMetrics(currentFragment)
 //                    debugDumpViewHierarchy(currentFragment)
 //                } catch (t: Throwable) {
-//                    Log.w("EpubPageCalc", "[디버그] 레이아웃 덤프 실패: ${t.message}")
+//                    logW { "[디버그] 레이아웃 덤프 실패: ${t.message}" }
 //                }
 
                 val samplingJson = collectSamplingData(currentFragment)
@@ -300,8 +322,8 @@ internal class EpubPageCalculationManager(
         samplingJson: String,
         getFragmentAt: (Int) -> R2EpubPageFragment?
     ) {
-        Log.d("EpubPageCalc", "[전체] 샘플링 데이터 수집 중...")
-        Log.d("EpubPageCalc", "[전체] 샘플링 데이터: $samplingJson")
+        logD { "[전체] 샘플링 데이터 수집 중..." }
+        logD { "[전체] 샘플링 데이터: $samplingJson" }
 
         var totalPageCount = 0
 
@@ -322,7 +344,7 @@ internal class EpubPageCalculationManager(
         for (link in linksToProcess) {
             val resource = publication.get(link)
             val documentHref = link.href?.toString() ?: ""
-            Log.d("EpubPageCalc", "[전체] 리소스 페이지 계산: ${link.href}")
+            logD { "[전체] 리소스 페이지 계산: ${link.href}" }
             if (resource != null) {
                 val htmlResult = resource.read()
                 htmlResult.getOrNull()?.let { bytes ->
@@ -334,10 +356,7 @@ internal class EpubPageCalculationManager(
                     val hrefsJson = JSONArray(hrefs).toString()
                     val inlineStylesJson = JSONArray(inlines).toString()
 
-                    Log.d(
-                        "EpubPageCalc",
-                        "[CSS DEBUG] 레지스트리 기반 호출: hrefs=${hrefs.size}, inlineStyles=${inlines.size}"
-                    )
+                    logD { "[CSS DEBUG] 레지스트리 기반 호출: hrefs=${hrefs.size}, inlineStyles=${inlines.size}" }
 
                     val result = wasmPageCalculator.calculatePagesWithRegistry(
                         html = html,
@@ -345,34 +364,25 @@ internal class EpubPageCalculationManager(
                         inlineStylesJson = inlineStylesJson,
                         samplingJson = samplingJson
                     )
-                    Log.d(
-                        "EpubPageCalc",
-                        "[전체] 리소스 결과 result=${result}"
-                    )
+                    logD { "[전체] 리소스 결과 result=${result}" }
 
                     when (result.status) {
                         WasmCalculationResult.Status.SUCCESS -> {
-                            Log.d(
-                                "EpubPageCalc",
-                                "[전체] WASM 정상 계산, 페이지 수: ${result.totalPages}"
-                            )
+                            logD { "[전체] WASM 정상 계산, 페이지 수: ${result.totalPages}" }
                             totalPageCount += result.totalPages
                             recordPageCountFor(link, result.totalPages)
                         }
 
                         WasmCalculationResult.Status.FALLBACK_NEEDED -> {
                             val count = getWebViewPageCount(link, getFragmentAt)
-                            Log.d(
-                                "EpubPageCalc",
-                                "[전체] WASM Fallback 필요, WebView 기반 계산 페이지 수: $count"
-                            )
+                            logD { "[전체] WASM Fallback 필요, WebView 기반 계산 페이지 수: $count" }
                             totalPageCount += count
                             recordPageCountFor(link, count)
                         }
 
                         WasmCalculationResult.Status.ERROR -> {
                             val est = estimatePagesByContentSize(html, samplingJson)
-                            Log.d("EpubPageCalc", "[전체] WASM 계산 오류, 컨텐츠 길이 기반 추정 페이지 수: $est")
+                            logD { "[전체] WASM 계산 오류, 컨텐츠 길이 기반 추정 페이지 수: $est" }
                             totalPageCount += est
                             recordPageCountFor(link, est)
                         }
@@ -381,7 +391,7 @@ internal class EpubPageCalculationManager(
             }
         }
 
-        Log.d("EpubPageCalc", "[전체] 전체 계산 완료, totalPageCount=$totalPageCount")
+        logD { "[전체] 전체 계산 완료, totalPageCount=$totalPageCount" }
         _totalPagesFlow.value = totalPageCount
     }
 
@@ -430,7 +440,7 @@ internal class EpubPageCalculationManager(
                     result.put(link.href.toString(), dim)
                 }
             } catch (t: Throwable) {
-                Log.w("EpubPageCalc", "[IMG] 치수 추출 실패: ${link.href} -> ${t.message}")
+                logW { "[IMG] 치수 추출 실패: ${link.href} -> ${t.message}" }
             }
         }
 
@@ -588,7 +598,7 @@ internal class EpubPageCalculationManager(
             """
         )
 
-        Log.d("EpubPageCalc", "[샘플링] JavaScript 결과: $metricsJson")
+        logD { "[샘플링] JavaScript 결과: $metricsJson" }
 
         // JavaScript가 JSON.stringify()로 이미 문자열로 반환한 결과를 다시 문자열로 감쌌으므로 따옴표 제거
         val cleanedJson = metricsJson.trim().removeSurrounding("\"").replace("\\\"", "\"")
@@ -600,9 +610,9 @@ internal class EpubPageCalculationManager(
         try {
             val dims = collectAllImageDimensions()
             obj.put("imageDimensions", dims)
-            Log.d("EpubPageCalc", "[샘플링] 이미지 치수 맵 포함: count=${dims.length()}")
+            logD { "[샘플링] 이미지 치수 맵 포함: count=${dims.length()}" }
         } catch (t: Throwable) {
-            Log.w("EpubPageCalc", "[샘플링] 이미지 치수 수집 실패: ${t.message}")
+            logW { "[샘플링] 이미지 치수 수집 실패: ${t.message}" }
         }
         Log.d("EpubPageCalc", "[샘플링] WASM 호환 샘플링 데이터 수집 완료")
 
@@ -617,7 +627,7 @@ internal class EpubPageCalculationManager(
         val index = readingOrder.indexOfFirst { it.href == link.href }
         val fragment = if (index >= 0) getFragmentAt(index) else null
         val pages = fragment?.webView?.numPages ?: 1
-        Log.d("EpubPageCalc", "[WebView] ${link.href} -> $pages 페이지 (WebView 기반)")
+        logD { "[WebView] ${link.href} -> $pages 페이지 (WebView 기반)" }
         return pages
     }
 
@@ -654,10 +664,7 @@ internal class EpubPageCalculationManager(
             1
         }
 
-        Log.d(
-            "EpubPageCalc",
-            "[추정] 텍스트 길이: $contentLength, 페이지당 글자 수: $charsPerPage -> $estimatedPages 페이지"
-        )
+        logD { "[추정] 텍스트 길이: $contentLength, 페이지당 글자 수: $charsPerPage -> $estimatedPages 페이지" }
         return estimatedPages
     }
 
@@ -667,7 +674,7 @@ internal class EpubPageCalculationManager(
     private suspend fun calculateTotalPagesWebViewFallback(
         getFragmentAt: (Int) -> R2EpubPageFragment?
     ) {
-        Log.d("EpubPageCalc", "[폴백] WebView 기반 전체 페이지 계산 시작")
+        logD { "[폴백] WebView 기반 전체 페이지 계산 시작" }
         var totalPages = 0
         // Reset per-resource results for fallback run
         _pagesByHrefFlow.value = mutableMapOf()
@@ -675,13 +682,13 @@ internal class EpubPageCalculationManager(
         for (i in readingOrder.indices) {
             val fragment = getFragmentAt(i)
             val pages = fragment?.webView?.numPages ?: 1
-            Log.d("EpubPageCalc", "[폴백] 리소스 인덱스 $i -> $pages 페이지")
+            logD { "[폴백] 리소스 인덱스 $i -> $pages 페이지" }
             totalPages += pages
             // Record by index and href if available
             val link = readingOrder[i]
             recordPageCountFor(link, pages)
         }
-        Log.d("EpubPageCalc", "[폴백] WebView 기반 총 페이지: $totalPages")
+        logD { "[폴백] WebView 기반 총 페이지: $totalPages" }
         _totalPagesFlow.value = totalPages
     }
 
@@ -718,7 +725,7 @@ internal class EpubPageCalculationManager(
             val rawHref = hrefMatch?.groups?.get(1)?.value ?: hrefMatch?.groups?.get(2)?.value
             if (!rawHref.isNullOrBlank()) {
                 val resolved = resolvePublicationHref(documentHref, rawHref)
-                Log.d("EpubPageCalc", "[CSS DEBUG] 스타일시트 추출: $resolved")
+                logD { "[CSS DEBUG] 스타일시트 추출: $resolved" }
                 result.add(resolved)
             }
         }
