@@ -98,6 +98,7 @@ import org.readium.r2.shared.util.Url
 import org.readium.r2.shared.util.mediatype.MediaType
 import org.readium.r2.shared.util.resource.Resource
 import org.readium.r2.shared.util.toAbsoluteUrl
+import org.readium.r2.wasm.EpubPageCalculationManager
 
 /**
  * Factory for a [JavascriptInterface] which will be injected in the web views.
@@ -158,7 +159,7 @@ public class EpubNavigatorFragment internal constructor(
     public fun getCurrentReadingProgress(): Double? {
         return pageCalculationManager.getCurrentReadingProgress(
             currentPagerPosition = currentPagerPosition,
-            getCurrentFragment = { currentReflowablePageFragment }
+            getCurrentFragment = { currentReflowablePageFragment?.toPageFragment() }
         )
     }
 
@@ -642,8 +643,8 @@ public class EpubNavigatorFragment internal constructor(
         // Start total pages calculation using pageCalculationManager
         viewLifecycleOwner.lifecycleScope.launch {
             pageCalculationManager.startCalculation(
-                getCurrentReflowablePageFragment = { currentReflowablePageFragment },
-                getFragmentAt = { index -> fragmentAt(index) as? R2EpubPageFragment }
+                getCurrentReflowablePageFragment = { currentReflowablePageFragment?.toPageFragment() },
+                getFragmentAt = { index -> (fragmentAt(index) as? R2EpubPageFragment)?.toPageFragment() }
             )
         }
     }

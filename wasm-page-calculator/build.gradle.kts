@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "org.readium.r2.navigator.wasm"
+    namespace = "org.readium.r2.wasm"
     compileSdk = 35
 
     defaultConfig {
@@ -202,6 +202,9 @@ tasks.named("check") {
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
+
+    // Add dependency on shared module for Publication, Link, etc.
+    implementation(project(":readium:readium-shared"))
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

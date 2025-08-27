@@ -4,7 +4,7 @@
  * available in the top-level LICENSE file of the project.
  */
 
-package org.readium.r2.navigator.epub
+package org.readium.r2.wasm
 
 import android.content.Context
 import android.util.Log
@@ -16,7 +16,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
 import org.json.JSONArray
-import org.readium.r2.navigator.pager.R2EpubPageFragment
 import org.readium.r2.shared.InternalReadiumApi
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.Link
@@ -29,12 +28,12 @@ import org.readium.r2.shared.util.mediatype.MediaType
  * Manager for calculating total pages in EPUB publications using WASM-based approach.
  */
 @OptIn(InternalReadiumApi::class)
-internal class EpubPageCalculationManager(
+public class EpubPageCalculationManager(
     private val context: Context,
     private val publication: Publication,
     private val readingOrder: List<Link>
 ) {
-    companion object {
+    public companion object {
         private const val TAG = "EpubPageCalc"
     }
 
@@ -42,7 +41,7 @@ internal class EpubPageCalculationManager(
     private var debugLogsEnabled: Boolean = false
 
     // Allows callers to toggle debug logging
-    fun setDebugLogging(enabled: Boolean) {
+    public fun setDebugLogging(enabled: Boolean) {
         debugLogsEnabled = enabled
     }
 
@@ -74,15 +73,15 @@ internal class EpubPageCalculationManager(
      * Null indicates the count is still being calculated.
      */
     private val _totalPagesFlow = MutableStateFlow<Int?>(null)
-    val totalPages: StateFlow<Int?> = _totalPagesFlow
+    public val totalPages: StateFlow<Int?> = _totalPagesFlow
 
     // Exposes per-resource page counts as they are computed: href -> pages
     private val _pagesByHrefFlow = MutableStateFlow<MutableMap<String, Int>>(mutableMapOf())
-    val pagesByHref: StateFlow<Map<String, Int>> = _pagesByHrefFlow
+    public val pagesByHref: StateFlow<Map<String, Int>> = _pagesByHrefFlow
 
     // Exposes per-reading-order index page counts; aligned with `readingOrder`
     private val _pagesByIndexFlow = MutableStateFlow(MutableList(readingOrder.size) { 0 })
-    val pagesByIndex: StateFlow<List<Int>> = _pagesByIndexFlow
+    public val pagesByIndex: StateFlow<List<Int>> = _pagesByIndexFlow
 
     // Cache of image dimensions for all EPUB-internal images. Built once, reused.
     private var imageDimensionsCache: JSONObject? = null
@@ -99,9 +98,9 @@ internal class EpubPageCalculationManager(
     /**
      * Initialize and start the page calculation process.
      */
-    suspend fun startCalculation(
-        getCurrentReflowablePageFragment: () -> R2EpubPageFragment?,
-        getFragmentAt: (Int) -> R2EpubPageFragment?
+    public suspend fun startCalculation(
+        getCurrentReflowablePageFragment: () -> PageFragment?,
+        getFragmentAt: (Int) -> PageFragment?
     ) {
         logE { "🔥 startCalculation() 호출됨!" }
 
@@ -119,7 +118,7 @@ internal class EpubPageCalculationManager(
     /**
      * Initialize WASM calculator and start total page count calculation.
      */
-    suspend fun initialize() {
+    public suspend fun initialize() {
         logE { "🔥 EpubPageCalculationManager.initialize() 호출됨!" }
 
         if (wasmPageCalculator.initialize()) {
@@ -218,16 +217,16 @@ internal class EpubPageCalculationManager(
     /**
      * Calculate total pages using sampling-based approach with WASM.
      */
-    suspend fun calculateTotalPages(
-        getCurrentFragment: () -> R2EpubPageFragment?,
-        getFragmentAt: (Int) -> R2EpubPageFragment?
+    public suspend fun calculateTotalPages(
+        getCurrentFragment: () -> PageFragment?,
+        getFragmentAt: (Int) -> PageFragment?
     ) {
         logE { "🔥 calculateTotalPages() 호출됨!" }
         logD { "[전체] 전체 EPUB 페이지 계산 시작" }
 
         // Wait for ViewPager and fragments to be created
         // First, try immediately without any delay
-        var currentFragment: R2EpubPageFragment? = getCurrentFragment()
+        var currentFragment: PageFragment? = getCurrentFragment()
 
         if (currentFragment == null) {
             logE { "🔥 첫 번째 시도 실패, 재시도 루프 시작..." }
@@ -267,13 +266,6 @@ internal class EpubPageCalculationManager(
             logE { "🔥 fragment.isLoaded = $isLoaded" }
             if (isLoaded) {
                 logD { "[전체] 현재 리소스의 샘플링 데이터 수집 완료, 각 리소스별 페이지 계산 시작" }
-//                // 디버그: 레이아웃/변수/하단 갭 분석 덤프
-//                try {
-//                    debugDumpLayoutMetrics(currentFragment)
-//                    debugDumpViewHierarchy(currentFragment)
-//                } catch (t: Throwable) {
-//                    logW { "[디버그] 레이아웃 덤프 실패: ${t.message}" }
-//                }
 
                 val samplingJson = collectSamplingData(currentFragment)
                 performSamplingBasedCalculation(samplingJson, getFragmentAt)
@@ -284,9 +276,9 @@ internal class EpubPageCalculationManager(
     /**
      * Get current reading progress as percentage (0.0 to 1.0).
      */
-    fun getCurrentReadingProgress(
+    public fun getCurrentReadingProgress(
         currentPagerPosition: Int,
-        getCurrentFragment: () -> R2EpubPageFragment?
+        getCurrentFragment: () -> PageFragment?
     ): Double? {
         val total = _totalPagesFlow.value ?: return null
         if (total <= 0) return 0.0
@@ -312,7 +304,8 @@ internal class EpubPageCalculationManager(
             ?: currentFragment?.webView?.numPages
             ?: 1
 
-        val currentPageOneBased = (currentPageInResourceZeroBased + 1).coerceIn(1, currentResourceTotalPages)
+        val currentPageOneBased =
+            (currentPageInResourceZeroBased + 1).coerceIn(1, currentResourceTotalPages)
         val currentAbsolutePage = (pagesBefore + currentPageOneBased).coerceAtMost(total)
 
         return (currentAbsolutePage.toDouble() / total.toDouble()).coerceIn(0.0, 1.0)
@@ -324,7 +317,7 @@ internal class EpubPageCalculationManager(
      */
     private suspend fun performSamplingBasedCalculation(
         samplingJson: String,
-        getFragmentAt: (Int) -> R2EpubPageFragment?
+        getFragmentAt: (Int) -> PageFragment?
     ) {
         logD { "[전체] 샘플링 데이터 수집 중..." }
         logD { "[전체] 샘플링 데이터: $samplingJson" }
@@ -342,7 +335,8 @@ internal class EpubPageCalculationManager(
             readingOrder
         }
 
-        val linksToProcess: List<Link> = flatLinks.filterByMediaTypes(listOf(MediaType.HTML, MediaType.XHTML))
+        val linksToProcess: List<Link> =
+            flatLinks.filterByMediaTypes(listOf(MediaType.HTML, MediaType.XHTML))
 
         // Process each resource (flattened)
         for (link in linksToProcess) {
@@ -455,7 +449,7 @@ internal class EpubPageCalculationManager(
     /**
      * Collect sampling data from a loaded WebView fragment.
      */
-    private suspend fun collectSamplingData(fragment: R2EpubPageFragment): String {
+    private suspend fun collectSamplingData(fragment: PageFragment): String {
         val webView = fragment.webView ?: throw IllegalStateException("WebView not available")
 
         // Collect metrics via JavaScript
@@ -678,7 +672,7 @@ internal class EpubPageCalculationManager(
     /**
      * Get page count for a specific resource using WebView (fallback method).
      */
-    private fun getWebViewPageCount(link: Link, getFragmentAt: (Int) -> R2EpubPageFragment?): Int {
+    private fun getWebViewPageCount(link: Link, getFragmentAt: (Int) -> PageFragment?): Int {
         // Find fragment by link URL
         val index = readingOrder.indexOfFirst { it.href == link.href }
         val fragment = if (index >= 0) getFragmentAt(index) else null
@@ -728,7 +722,7 @@ internal class EpubPageCalculationManager(
      * Fallback to traditional WebView-based total page calculation.
      */
     private suspend fun calculateTotalPagesWebViewFallback(
-        getFragmentAt: (Int) -> R2EpubPageFragment?
+        getFragmentAt: (Int) -> PageFragment?
     ) {
         logD { "[폴백] WebView 기반 전체 페이지 계산 시작" }
         var totalPages = 0
@@ -751,7 +745,7 @@ internal class EpubPageCalculationManager(
     /**
      * Clean up resources when manager is destroyed.
      */
-    fun destroy() {
+    public fun destroy() {
         wasmPageCalculator.destroy()
     }
 

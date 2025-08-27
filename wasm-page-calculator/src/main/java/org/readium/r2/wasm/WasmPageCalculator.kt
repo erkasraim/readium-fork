@@ -4,11 +4,10 @@
  * available in the top-level LICENSE file of the project.
  */
 
-package org.readium.r2.navigator.epub
+package org.readium.r2.wasm
 
 import android.content.Context
 import android.util.Log
-import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.Dispatchers
@@ -99,7 +98,7 @@ public data class BodyStyle(
 /**
  * Interface for calculating the number of pages using WASM with sampling data.
  */
-internal interface WasmPageCalculator {
+public interface WasmPageCalculator {
     /**
      * Calculate total pages for HTML content using sampling JSON from WebView.
      */
@@ -143,7 +142,7 @@ internal interface WasmPageCalculator {
 /**
  * Default implementation of WASM page calculator.
  */
-internal class DefaultWasmPageCalculator(
+public class DefaultWasmPageCalculator(
     private val context: Context
 ) : WasmPageCalculator {
 
@@ -152,7 +151,7 @@ internal class DefaultWasmPageCalculator(
     private var wasmJsCode: String? = null
 
     // Toggle for WASM internal debug logs
-    var enableDebugLogs: Boolean = false
+    public var enableDebugLogs: Boolean = false
 
     override suspend fun initialize(): Boolean = withContext(Dispatchers.Main) {
         try {
@@ -664,7 +663,8 @@ internal class DefaultWasmPageCalculator(
             val htmlJs = JSONObject.quote(html)
             val cssJs = JSONObject.quote(cssText)
             val samplingJs = JSONObject.quote(samplingJson)
-            val jsCode = "calculatePagesWasm($htmlJs, $cssJs, $samplingJs, ${if (enableDebugLogs) "true" else "false"})"
+            val jsCode =
+                "calculatePagesWasm($htmlJs, $cssJs, $samplingJs, ${if (enableDebugLogs) "true" else "false"})"
 
             webView.evaluateJavascript(jsCode) { result ->
                 if (result != null && result != "null") {

@@ -10,7 +10,6 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import org.readium.r2.navigator.pager.R2EpubPageFragment
 
 /**
  * Extension functions for working with EPUB total page counts.
